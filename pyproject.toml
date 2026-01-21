@@ -1,0 +1,17 @@
+[project]
+name = "reproduce-mitoses-grading-10-1016-j-asoc-2020-106808"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.1",
+    "pillow>=12.1.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.12.0",
+    "scikit-image>=0.26.0",
+    "scikit-learn>=1.8.0",
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "tqdm>=4.67.1",
+]
