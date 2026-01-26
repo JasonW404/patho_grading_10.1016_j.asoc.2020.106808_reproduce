@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -27,20 +28,24 @@ logger = logging.getLogger(__name__)
 class ROISelectorDataset(Dataset):
     """PyTorch Dataset for ROI Selection."""
     
-    def __init__(self, csv_path: Path, feature_config: RoiSelectorFeatureConfig):
+    def __init__(self, csv_path: Path, feature_config: RoiSelectorFeatureConfig, max_positive: int | None = None, max_negative: int | None = None):
         self.feature_config = feature_config
         self.samples = []
         
-        with open(csv_path, 'r') as f:
-            reader = csv.reader(f)
-            header = next(reader, None) # Skip header if exists 'path, label'
-            if header and header[0] != 'path':
-                # No header? reset
-                f.seek(0)
+        df = pd.read_csv(csv_path).astype({'path': str, 'label': int})
+        
+        if max_positive is not None or max_negative is not None:
+            positive_df = df[df['label'] == 1]
+            negative_df = df[df['label'] == 0]
             
-            for line in reader:
-                if len(line) >= 2:
-                    self.samples.append((line[0], int(line[1])))
+            if max_positive is not None:
+                positive_df = positive_df.head(max_positive)
+            if max_negative is not None:
+                negative_df = negative_df.head(max_negative)
+            
+            df = pd.concat([positive_df, negative_df], ignore_index=True)
+        
+        self.samples = list(df.itertuples(index=False, name=None))
     
     def __len__(self):
         return len(self.samples)
@@ -77,12 +82,12 @@ class ROISelectorDataLoader:
         create_negative_roi(self.config)
         generate_labelled_csv(self.config)
 
-    def get_dataloader(self, batch_size: int = 32, shuffle: bool = True, num_workers: int = 4) -> DataLoader:
+    def get_dataloader(self, batch_size: int = 32, shuffle: bool = True, num_workers: int = 4, max_positive: int | None = None, max_negative: int | None = None) -> DataLoader:
         csv_path = self.config.train_dataset_dir / "ROI_labelled.csv"
         if not csv_path.exists():
             self.generate_dataset()
             
-        dataset = ROISelectorDataset(csv_path, self.config.feature_config)
+        dataset = ROISelectorDataset(csv_path, self.config.feature_config, max_positive=max_positive, max_negative=max_negative)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 

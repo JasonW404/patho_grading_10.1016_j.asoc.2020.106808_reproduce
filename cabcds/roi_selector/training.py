@@ -34,7 +34,7 @@ class RoiSelectorTrainer:
         loader = ROISelectorDataLoader(self.config)
         
         # Get DataLoader (will generate data if needed)
-        dl = loader.get_dataloader(batch_size=32, shuffle=True, num_workers=2)
+        dl = loader.get_dataloader(batch_size=32, shuffle=True, num_workers=2, max_positive=148, max_negative=544)
 
         self.logger.info("Loading samples from DataLoader...")
         all_features = []

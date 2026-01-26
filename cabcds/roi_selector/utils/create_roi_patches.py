@@ -80,9 +80,7 @@ def _process_positive_wsi(args: Tuple[Path, ROISelectorConfig]) -> int:
         if candidate.exists():
             wsi_path = candidate
             break
-    
     if not wsi_path:
-        # logger.warning(f"WSI not found for {csv_file.name}") # Avoid spamming logs from workers if common
         return 0
         
     try:
