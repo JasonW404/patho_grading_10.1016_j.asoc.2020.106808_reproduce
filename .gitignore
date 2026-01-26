@@ -9,4 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-references
+reference/
+dataset
+dataset/
+artifact/
+output/
+temp/

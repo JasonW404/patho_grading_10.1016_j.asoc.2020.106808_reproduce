@@ -1,4 +1,4 @@
-"""Configuration models for stage two ROI selection."""
+"""Configuration models for ROI selector (incorporating stage one data preparation)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+
+from cabcds.config import Config
 
 
 class RoiSelectorFeatureConfig(BaseModel):
@@ -30,85 +32,117 @@ class RoiSelectorFeatureConfig(BaseModel):
     max_white_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
-class RoiSelectorTrainingConfig(BaseSettings):
-    """Configuration for training the ROI selector SVM.
-
-    Attributes:
-        dataset_dir: Directory containing ROI training patches.
-        positive_subdir: Subdirectory name for positive patches.
-        negative_subdir: Subdirectory name for negative patches.
-        model_output_path: Output path for the trained SVM model.
-        image_extensions: Supported image extensions.
-        svm_c: Regularization strength for linear SVM.
-        feature_config: Feature extraction settings.
-    """
+class ROISelectorConfig(BaseSettings):
+    """Unified configuration for ROI Selector (Data Prep, Training, Inference)."""
 
     class Config:
-        env_prefix = "CABCDS_ROI_TRAIN_"
+        env_prefix = "CABCDS_ROI_"
         env_nested_delimiter = "__"
         frozen = True
 
-    dataset_dir: Path = Field(default=Path("data/roi_selector/training"))
-    positive_subdir: str = Field(default="positive")
-    negative_subdir: str = Field(default="negative")
-    model_output_path: Path = Field(default=Path("data/roi_selector/models/roi_svm.joblib"))
-    image_extensions: tuple[str, ...] = Field(
-        default=(".png", ".jpg", ".jpeg", ".tif", ".tiff")
+    # --- Data Loader ---
+    preproc_dataset_dir: Path = Field(
+        default=Path("dataset/train"),
+        description="Directory containing raw WSI-derived images for preprocessing."
     )
-    svm_c: float = Field(default=1.0, gt=0.0)
+    preproc_output_dir: Path = Field(
+        default=Path("output/roi_selector/preprocessed"),
+        description="Directory to store normalized images and masks."
+    )
+    preproc_reference_image_path: Path | None = Field(
+        default=None,
+        description="Optional path to a reference image for stain normalization."
+    )
+    preproc_image_extensions: tuple[str, ...] = Field(
+        default=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".svs"),
+        description="Allowed image extensions for preprocessing."
+    )
+    preproc_min_blob_area: int = Field(
+        default=10, 
+        description="Minimum blob area (in pixels) to keep after Otsu thresholding."
+    )
+    preproc_overwrite: bool = Field(
+        default=False,
+        description="Whether to overwrite existing preprocessing outputs."
+    )
+    preproc_max_images: int | None = Field(
+        default=None,
+        description="Optional cap on the number of images to preprocess."
+    )
+    
+    # --- Data Generation ---
+    roi_csv_dir: Path = Field(
+        default=Path("dataset/auxiliary_dataset_roi"),
+        description="Directory containing ROI CSV files."
+    )
+    sampling_magnification: float = Field(
+        default=40.0,
+        description="Magnification to sample patches at (e.g., 40.0, 10.0, 20.0)."
+    )
+
+    # --- Training ---
+    train_dataset_dir: Path = Field(
+        default=Path("output/roi_selector/training"),
+        description="Directory containing ROI training patches."
+    )
+    train_positive_subdir: str = Field(default="positive")
+    train_negative_subdir: str = Field(default="negative")
+    train_model_output_path: Path = Field(default=Path("output/roi_selector/models/roi_svm.joblib"))
+    train_image_extensions: tuple[str, ...] = Field(
+        default=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".svs")
+    )
+    train_svm_c: float = Field(default=1.0, gt=0.0)
+
+    # --- Inference ---
+    infer_wsi_dir: Path = Field(
+        default=Path("dataset/test"),
+        description="Directory containing WSI images for inference (test)."
+    )
+    infer_output_dir: Path = Field(
+        default=Path("output/roi_selector/outputs"),
+        description="Output directory for ROI results."
+    )
+    infer_model_path: Path = Field(default=Path("output/roi_selector/models/roi_svm.joblib"))
+    infer_image_extensions: tuple[str, ...] = Field(
+        default=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".svs")
+    )
+    infer_patch_size: int = Field(default=512, ge=64)
+    infer_overlap_ratio: float = Field(default=0.1, ge=0.0, lt=1.0)
+    infer_exclude_border: int = Field(default=1000, ge=0)
+    infer_top_n: int = Field(default=4, ge=1)
+    infer_save_patches: bool = Field(default=True)
+    infer_max_images: int | None = Field(default=None)
+
+    # --- Shared Feature Config ---
     feature_config: RoiSelectorFeatureConfig = Field(default_factory=RoiSelectorFeatureConfig)
 
-
-class RoiSelectorInferenceConfig(BaseSettings):
-    """Configuration for ROI selection over WSI images.
-
-    Attributes:
-        wsi_dir: Directory containing WSI images.
-        output_dir: Output directory for ROI results.
-        model_path: Path to trained SVM model.
-        image_extensions: Supported image extensions.
-        patch_size: Patch size in pixels.
-        overlap_ratio: Overlap ratio for sliding window.
-        exclude_border: Border size to skip (in pixels).
-        top_n: Number of top ROIs to keep.
-        save_patches: Whether to save selected ROI patches.
-        feature_config: Feature extraction settings.
-    """
-
-    class Config:
-        env_prefix = "CABCDS_ROI_INFER_"
-        env_nested_delimiter = "__"
-        frozen = True
-
-    wsi_dir: Path = Field(default=Path("dataset"))
-    output_dir: Path = Field(default=Path("data/roi_selector/outputs"))
-    model_path: Path = Field(default=Path("data/roi_selector/models/roi_svm.joblib"))
-    image_extensions: tuple[str, ...] = Field(
-        default=(".png", ".jpg", ".jpeg", ".tif", ".tiff")
-    )
-    patch_size: int = Field(default=512, ge=64)
-    overlap_ratio: float = Field(default=0.1, ge=0.0, lt=1.0)
-    exclude_border: int = Field(default=1000, ge=0)
-    top_n: int = Field(default=4, ge=1)
-    save_patches: bool = Field(default=True)
-    feature_config: RoiSelectorFeatureConfig = Field(default_factory=RoiSelectorFeatureConfig)
+    # --- Initialization (Directory Creation) ---
+    def __init__(self, **data) -> None:
+        super().__init__(**data)
+        self.preproc_output_dir.mkdir(parents=True, exist_ok=True)
+        self.infer_output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def load_roi_selector_training_config() -> RoiSelectorTrainingConfig:
-    """Load ROI selector training configuration.
+def load_roi_selector_config() -> ROISelectorConfig:
+    """Load unified ROI selector configuration.
 
     Returns:
-        RoiSelectorTrainingConfig instance.
+        ROISelectorConfig instance.
     """
+    global_config = Config()
+    config = ROISelectorConfig()
 
-    return RoiSelectorTrainingConfig()
+    if global_config.debug:
+        debug_limit = global_config.debug_max_images
+        
+        # Apply debug limit to both preprocessing and inference
+        updates = {}
+        if config.preproc_max_images is None or config.preproc_max_images > debug_limit:
+            updates["preproc_max_images"] = debug_limit
+        if config.infer_max_images is None or config.infer_max_images > debug_limit:
+            updates["infer_max_images"] = debug_limit
+            
+        if updates:
+             config = config.model_copy(update=updates)
 
-
-def load_roi_selector_inference_config() -> RoiSelectorInferenceConfig:
-    """Load ROI selector inference configuration.
-
-    Returns:
-        RoiSelectorInferenceConfig instance.
-    """
-
-    return RoiSelectorInferenceConfig()
+    return config

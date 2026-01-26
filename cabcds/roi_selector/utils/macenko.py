@@ -11,10 +11,25 @@ import numpy as np
 class MacenkoNormalizer:
     """Apply Macenko stain normalization to histology images.
 
+    This class implements the stain normalization method described by Macenko et al. (2009).
+    The algorithm normalizes the appearance of histology images by estimating stain vectors
+    and concentration maps.
+
     Attributes:
         io_max: Maximum intensity used for optical density conversion.
         alpha: Percentile for stain angle selection.
         beta: OD threshold to exclude transparent pixels.
+
+    The algorithm consists of the following steps:
+    1.  Convert RGB image to Optical Density (OD) space.
+    2.  Filter out background pixels with low OD values (below `beta`).
+    3.  Compute Singular Value Decomposition (SVD) on the OD pixels to find the plane
+        of stain vectors.
+    4.  Project OD pixels onto the plane and calculate angles.
+    5.  Estimate stain vectors using robust extremes (percentiles defined by `alpha`)
+        of the angular distribution.
+    6.  Deconvolve the image to get stain concentrations.
+    7.  Normalize concentrations based on the 99th percentile and reconstruct the image.
     """
 
     io_max: float = 255.0
@@ -69,7 +84,7 @@ class MacenkoNormalizer:
 
         optical_density = self._rgb_to_od(image)
         optical_density = optical_density.reshape((-1, 3))
-        filtered = optical_density[np.all(optical_density > self.beta, axis=1)]
+        filtered = optical_density[np.any(optical_density > self.beta, axis=1)]
         if filtered.shape[0] < 10:
             filtered = optical_density
 

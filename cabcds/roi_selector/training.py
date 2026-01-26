@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 
 import joblib
@@ -11,33 +10,19 @@ import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
+from sklearn.model_selection import cross_val_score
+from tqdm import tqdm
 
-from cabcds.data_preparation.io import list_image_files, load_rgb_image
-from cabcds.roi_selector.config import RoiSelectorTrainingConfig
-from cabcds.roi_selector.features import extract_patch_features, is_patch_too_white
-
-
-@dataclass(frozen=True)
-class RoiTrainingSample:
-    """Training sample metadata.
-
-    Attributes:
-        image_path: Path to the image file.
-        label: Integer label (1 for positive, 0 for negative).
-        features: Feature vector.
-    """
-
-    image_path: Path
-    label: int
-    features: np.ndarray
+from .utils.loader import ROISelectorDataLoader
+from .config import ROISelectorConfig, load_roi_selector_config
 
 
 class RoiSelectorTrainer:
     """Train a linear SVM for ROI selection."""
 
-    def __init__(self, config: RoiSelectorTrainingConfig) -> None:
+    def __init__(self, config: ROISelectorConfig) -> None:
         self.config = config
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(f"cabcds.{self.__class__.__name__}")
 
     def train(self) -> Pipeline:
         """Train the ROI selector.
@@ -45,60 +30,51 @@ class RoiSelectorTrainer:
         Returns:
             Trained sklearn Pipeline.
         """
+        self.logger.info("Initializing Data Loader...")
+        loader = ROISelectorDataLoader(self.config)
+        
+        # Get DataLoader (will generate data if needed)
+        dl = loader.get_dataloader(batch_size=32, shuffle=True, num_workers=2)
 
-        samples = self._load_samples()
-        if not samples:
-            raise FileNotFoundError("No training samples found for ROI selector.")
+        self.logger.info("Loading samples from DataLoader...")
+        all_features = []
+        all_labels = []
 
-        features = np.stack([sample.features for sample in samples])
-        labels = np.array([sample.label for sample in samples], dtype=np.int32)
+        # Iterate to collect all data for SVM
+        for features, labels in tqdm(dl, desc="Loading Batches"):
+            if features.ndim > 1: # Handle batch
+                all_features.append(features.numpy())
+                all_labels.append(labels.numpy())
+        
+        if not all_features:
+            raise ValueError("No training data found or loaded.")
+
+        X = np.concatenate(all_features, axis=0)
+        y = np.concatenate(all_labels, axis=0)
+        
+        self.logger.info(f"Loaded {len(X)} samples. Positive: {np.sum(y==1)}, Negative: {np.sum(y==0)}")
 
         model = Pipeline(
             [
                 ("scaler", StandardScaler()),
-                ("svm", LinearSVC(C=self.config.svm_c, max_iter=5000)),
+                ("svm", LinearSVC(C=self.config.train_svm_c, max_iter=5000)),
             ]
         )
-        model.fit(features, labels)
+        
+        # 10-fold Cross Validation as per paper
+        self.logger.info("Running 10-fold Cross-Validation...")
+        try:
+            scores = cross_val_score(model, X, y, cv=10)
+            self.logger.info(f"CV Accuracy: {scores.mean():.4f} (+/- {scores.std() * 2:.4f})")
+        except Exception as e:
+            self.logger.warning(f"CV failed (possibly too few samples): {e}")
+
+        self.logger.info("Training final model on all data...")
+        model.fit(X, y)
 
         self._save_model(model)
-        self.logger.info("ROI selector training completed with %d samples.", len(samples))
+        self.logger.info("ROI selector training completed.")
         return model
-
-    def _load_samples(self) -> list[RoiTrainingSample]:
-        """Load training samples from positive/negative directories.
-
-        Returns:
-            List of training samples.
-        """
-
-        dataset_dir = self.config.dataset_dir
-        positives = self._collect_samples(dataset_dir / self.config.positive_subdir, label=1)
-        negatives = self._collect_samples(dataset_dir / self.config.negative_subdir, label=0)
-        return positives + negatives
-
-    def _collect_samples(self, root: Path, label: int) -> list[RoiTrainingSample]:
-        """Collect samples under a directory.
-
-        Args:
-            root: Directory containing images.
-            label: Label for the samples.
-
-        Returns:
-            List of RoiTrainingSample objects.
-        """
-
-        extensions = {ext.lower() for ext in self.config.image_extensions}
-        files = list_image_files(root, extensions) if root.exists() else []
-        samples: list[RoiTrainingSample] = []
-
-        for image_path in files:
-            image = load_rgb_image(image_path)
-            if is_patch_too_white(image, self.config.feature_config):
-                continue
-            features = extract_patch_features(image, self.config.feature_config)
-            samples.append(RoiTrainingSample(image_path=image_path, label=label, features=features))
-        return samples
 
     def _save_model(self, model: Pipeline) -> None:
         """Save the trained model to disk.
@@ -107,7 +83,7 @@ class RoiSelectorTrainer:
             model: Trained sklearn pipeline.
         """
 
-        output_path = self.config.model_output_path
+        output_path = self.config.train_model_output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
             {
@@ -117,3 +93,16 @@ class RoiSelectorTrainer:
             output_path,
         )
         self.logger.info("Saved ROI selector model to %s", output_path)
+
+
+def main() -> None:
+    """Run ROI training standalone."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    config = load_roi_selector_config()
+    trainer = RoiSelectorTrainer(config)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
+

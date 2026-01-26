@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+import openslide
 from PIL import Image
 
 
@@ -36,6 +37,28 @@ def load_rgb_image(image_path: Path) -> np.ndarray:
     Returns:
         Image as a uint8 RGB array with shape (H, W, 3).
     """
+
+    if image_path.suffix.lower() == ".svs":
+        with openslide.OpenSlide(str(image_path)) as slide:
+            # For SVS files, loading the entire image is impossible in memory.
+            # In debug mode (or default behavior for this reproduction script),
+            # we load a center crop at FULL resolution (Level 0) to ensure
+            # texture features are preserved for normalization and ROI selection.
+            # A 2048x2048 crop is manageable (12MB raw).
+            
+            width, height = slide.dimensions
+            crop_size = 2048
+            
+            # If image is smaller than crop, read everything
+            if width <= crop_size and height <= crop_size:
+                image = slide.read_region((0, 0), 0, (width, height))
+            else:
+                x = (width - crop_size) // 2
+                y = (height - crop_size) // 2
+                image = slide.read_region((x, y), 0, (crop_size, crop_size))
+                
+            rgb_image = image.convert("RGB")
+        return np.array(rgb_image, dtype=np.uint8)
 
     with Image.open(image_path) as image:
         rgb_image = image.convert("RGB")
@@ -95,7 +118,11 @@ def compute_output_path(
     """
 
     relative_path = input_path.relative_to(dataset_dir)
-    new_name = f"{relative_path.stem}_{suffix}{relative_path.suffix}"
+    ext = relative_path.suffix
+    # PIL cannot write .svs, so we switch to .jpeg for SVS inputs
+    if ext.lower() == ".svs":
+        ext = ".jpeg"
+    new_name = f"{relative_path.stem}_{suffix}{ext}"
     return output_dir / relative_path.with_name(new_name)
 
 

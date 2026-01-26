@@ -14,8 +14,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from cabcds.data_preparation.blue_ratio import compute_blob_stats
-from cabcds.data_preparation.io import load_rgb_image
+from cabcds.roi_selector.data_loader.blue_ratio import compute_blob_stats
+from cabcds.roi_selector.data_loader.io import load_rgb_image
 from cabcds.hybrid_descriptor.config import (
     HybridDescriptorConfig,
     HybridDescriptorInferenceConfig,

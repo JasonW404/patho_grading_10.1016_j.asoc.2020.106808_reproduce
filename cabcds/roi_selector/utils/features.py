@@ -7,8 +7,8 @@ from typing import Tuple
 import numpy as np
 from skimage import color, feature
 
-from cabcds.data_preparation.blue_ratio import compute_blue_ratio, compute_blob_stats, otsu_mask
-from cabcds.roi_selector.config import RoiSelectorFeatureConfig
+from ..config import RoiSelectorFeatureConfig
+from .blue_ratio import compute_blue_ratio, compute_blob_stats, otsu_mask
 
 
 def is_patch_too_white(patch: np.ndarray, config: RoiSelectorFeatureConfig) -> bool:
@@ -40,7 +40,7 @@ def extract_patch_features(patch: np.ndarray, config: RoiSelectorFeatureConfig) 
 
     color_features = _compute_color_histograms(patch, config.color_bins)
     texture_features = _compute_lbp_histogram(patch, config)
-    cell_count = _compute_cell_count(patch, config.min_blob_area)
+    cell_count = compute_cell_count(patch, config.min_blob_area)
     return np.concatenate([color_features, texture_features, np.array([cell_count], dtype=np.float32)])
 
 
@@ -99,6 +99,9 @@ def _compute_lbp_histogram(patch: np.ndarray, config: RoiSelectorFeatureConfig) 
     """
 
     gray = color.rgb2gray(patch)
+    # Convert to integers to avoid warning: "Applying `local_binary_pattern` to floating-point images..."
+    gray = (gray * 255).astype(np.uint8)
+    
     lbp = feature.local_binary_pattern(
         gray,
         P=config.lbp_neighbors,
@@ -129,7 +132,7 @@ def _lbp_bin_count(config: RoiSelectorFeatureConfig) -> int:
     return 2 ** config.lbp_neighbors
 
 
-def _compute_cell_count(patch: np.ndarray, min_blob_area: int) -> float:
+def compute_cell_count(patch: np.ndarray, min_blob_area: int) -> float:
     """Compute the cell count using blue-ratio and Otsu segmentation.
 
     Args:

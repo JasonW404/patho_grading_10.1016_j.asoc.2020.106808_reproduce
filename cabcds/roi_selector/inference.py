@@ -10,10 +10,14 @@ from typing import Iterable
 import joblib
 import numpy as np
 
-from cabcds.data_preparation.io import compute_report_path, list_image_files, load_rgb_image, save_image_uint8
-from cabcds.roi_selector.config import RoiSelectorFeatureConfig, RoiSelectorInferenceConfig
-from cabcds.roi_selector.features import extract_patch_features, is_patch_too_white
-from cabcds.roi_selector.sampling import PatchSample, SlidingWindowSampler
+from ..data_loader.io import compute_report_path, list_image_files, load_rgb_image, save_image_uint8
+from .config import (
+    RoiSelectorFeatureConfig,
+    ROISelectorConfig, 
+    load_roi_selector_config,
+)
+from .utils.features import extract_patch_features, is_patch_too_white
+from .sampling import PatchSample, SlidingWindowSampler
 
 
 @dataclass(frozen=True)
@@ -49,10 +53,10 @@ class RoiSelectionResult:
 class RoiSelector:
     """Select ROIs from WSI images using a trained SVM."""
 
-    def __init__(self, config: RoiSelectorInferenceConfig) -> None:
+    def __init__(self, config: ROISelectorConfig) -> None:
         self.config = config
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.model, self.feature_config = self._load_model(config.model_path)
+        self.logger = logging.getLogger(f"cabcds.{self.__class__.__name__}")
+        self.model, self.feature_config = self._load_model(config.infer_model_path)
         self.sampler = SlidingWindowSampler(config)
 
     def select_rois(self) -> list[RoiSelectionResult]:
@@ -62,7 +66,11 @@ class RoiSelector:
             List of ROI selection results.
         """
 
-        image_files = list_image_files(self.config.wsi_dir, {ext.lower() for ext in self.config.image_extensions})
+        image_files = list_image_files(self.config.infer_wsi_dir, {ext.lower() for ext in self.config.infer_image_extensions})
+        if self.config.infer_max_images is not None:
+            self.logger.info(f"Limiting to {self.config.infer_max_images} images.")
+            image_files = image_files[: self.config.infer_max_images]
+
         if not image_files:
             raise FileNotFoundError("No WSI images found for ROI selection.")
 
@@ -87,9 +95,9 @@ class RoiSelector:
         image = load_rgb_image(image_path)
         candidates = list(self._score_candidates(image))
         candidates.sort(key=lambda candidate: candidate.score, reverse=True)
-        selected = tuple(candidates[: self.config.top_n])
+        selected = tuple(candidates[: self.config.infer_top_n])
 
-        if self.config.save_patches:
+        if self.config.infer_save_patches:
             self._save_patches(image_path, selected)
 
         self.logger.info(
@@ -124,7 +132,7 @@ class RoiSelector:
             candidates: Selected ROI candidates.
         """
 
-        output_dir = self.config.output_dir / "patches" / image_path.stem
+        output_dir = self.config.infer_output_dir / "patches" / image_path.stem
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for index, candidate in enumerate(candidates, start=1):
@@ -138,7 +146,7 @@ class RoiSelector:
             results: ROI selection results.
         """
 
-        report_path = compute_report_path(self.config.output_dir, "stage_two_roi_selection.csv")
+        report_path = compute_report_path(self.config.infer_output_dir, "stage_two_roi_selection.csv")
         report_path.parent.mkdir(parents=True, exist_ok=True)
 
         header = "image_path,rank,x,y,score\n"
@@ -164,3 +172,16 @@ class RoiSelector:
         model = payload["model"]
         feature_config = RoiSelectorFeatureConfig.model_validate(payload.get("feature_config", {}))
         return model, feature_config
+
+
+def main() -> None:
+    """Run ROI inference standalone."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    config = load_roi_selector_config()
+    selector = RoiSelector(config)
+    selector.select_rois()
+
+
+if __name__ == "__main__":
+    main()
+
