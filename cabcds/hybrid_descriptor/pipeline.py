@@ -21,8 +21,8 @@ from cabcds.hybrid_descriptor.config import (
     HybridDescriptorInferenceConfig,
 )
 from cabcds.hybrid_descriptor.descriptor import HybridDescriptorBuilder, RoiMetrics
-from cabcds.mf_cnn.mitosis_detection_net import MitosisDetectionNet
-from cabcds.mf_cnn.mitosis_segmentation_net import MitosisSegmentationNet
+from cabcds.mf_cnn.cnn import CNNDet
+from cabcds.mf_cnn.mitosis_segmentation_net import CNNSeg
 from cabcds.mf_cnn.roi_scoring_net import RoiScoringNet
 
 
@@ -283,12 +283,12 @@ def _collect_roi_patches(root_dir: Path, extensions: tuple[str, ...]) -> list[Ro
 
 def _load_segmentation_model(
     config: HybridDescriptorInferenceConfig, device: torch.device
-) -> MitosisSegmentationNet | None:
+) -> CNNSeg | None:
     """Load CNN_seg model if available."""
 
     if config.segmentation_model_path is None:
         return None
-    model = MitosisSegmentationNet(pretrained=False)
+    model = CNNSeg(pretrained=False)
     state = torch.load(config.segmentation_model_path, map_location=device)
     model.load_state_dict(state)
     model.to(device)
@@ -297,12 +297,12 @@ def _load_segmentation_model(
 
 def _load_detection_model(
     config: HybridDescriptorInferenceConfig, device: torch.device
-) -> MitosisDetectionNet | None:
+) -> CNNDet | None:
     """Load CNN_det model if available."""
 
     if config.detection_model_path is None:
         return None
-    model = MitosisDetectionNet(pretrained=False)
+    model = CNNDet(pretrained=False)
     state = torch.load(config.detection_model_path, map_location=device)
     model.load_state_dict(state)
     model.to(device)
