@@ -17,12 +17,16 @@ The ROI Selector module identifies and extracts candidate Regions of Interest (R
 - For inference: use the ROI Selector to prepare candidate patches, then pass them to the MF-CNN inference pipeline.
 
 **Files & Locations**
-- Module code: `cabcds/train/roi_selector/` and helper utilities in `cabcds/train/roi_selector/utils/`.
-- Outputs: `output/roi_selector/` (preprocessed patches and sampling outputs).
+- Module code: `cabcds/roi_selector/` and helper utilities in `cabcds/roi_selector/utils/`.
+- Outputs: `output/roi_selector/` (training patches, models, reports).
 
 **Notes**
-- See the project root README for full pipeline instructions and dependencies.
+- See the project root README for full pipeline instructions, setup, and runnable commands.
 - Configuration parameters are defined in the module `config.py` files inside the ROI Selector folders.
 
-If you want, I can expand this with example commands, configuration explanations, or a quick usage snippet.
+**Quick usage**
+
+- Prepare training patches: `uv run python roi_selector.py --prepare`
+- Train SVM: `uv run python roi_selector.py --train`
+- Run inference: `uv run python main.py`
 

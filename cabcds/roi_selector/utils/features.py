@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import numpy as np
-from skimage import color, feature
+from skimage import color, feature, measure
 
 from ..config import RoiSelectorFeatureConfig
 from .blue_ratio import compute_blue_ratio, compute_blob_stats, otsu_mask
@@ -142,8 +142,40 @@ def compute_cell_count(patch: np.ndarray, min_blob_area: int) -> float:
     Returns:
         Estimated cell count.
     """
+    stats = get_tissue_stats(patch, min_blob_area)
+    return float(stats[0])
 
+
+def get_tissue_stats(patch: np.ndarray, min_blob_area: int) -> Tuple[int, float, float]:
+    """Compute tissue statistics (count, area ratio, and potential nuclear area).
+
+    Args:
+        patch: RGB patch array.
+        min_blob_area: Minimum blob area threshold.
+
+    Returns:
+        Tuple of (blob_count, foreground_ratio, dark_pixel_ratio).
+    """
     blue_ratio = compute_blue_ratio(patch)
     mask = otsu_mask(blue_ratio)
-    stats = compute_blob_stats(mask, min_blob_area)
-    return float(stats.blob_count)
+    
+    # Calculate stats using skimage.measure
+    labeled = measure.label(mask)
+    regions = [region for region in measure.regionprops(labeled) if region.area >= min_blob_area]
+    
+    blob_count = len(regions)
+    if mask.size > 0:
+        # Sum areas of valid blobs only
+        valid_area = sum(r.area for r in regions)
+        ratio = valid_area / mask.size
+    else:
+        ratio = 0.0
+    
+    # Additional check: Dark pixel ratio
+    # Cells are usually darker than stroma. A high dark pixel ratio with low cell count
+    # indicates the Blue Ratio algorithm failed to segment clearly visible cells.
+    # Threshold 0.70 corresponds to pixel value ~178.
+    gray = color.rgb2gray(patch)
+    dark_pixel_ratio = float(np.mean(gray < 0.70))
+        
+    return blob_count, ratio, dark_pixel_ratio

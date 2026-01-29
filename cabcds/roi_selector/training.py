@@ -34,7 +34,7 @@ class RoiSelectorTrainer:
         loader = ROISelectorDataLoader(self.config)
         
         # Get DataLoader (will generate data if needed)
-        dl = loader.get_dataloader(batch_size=32, shuffle=True, num_workers=2, max_positive=148, max_negative=544)
+        dl = loader.get_dataloader(batch_size=32, shuffle=True, num_workers=2)
 
         self.logger.info("Loading samples from DataLoader...")
         all_features = []
@@ -42,7 +42,12 @@ class RoiSelectorTrainer:
 
         # Iterate to collect all data for SVM
         for features, labels in tqdm(dl, desc="Loading Batches"):
-            if features.ndim > 1: # Handle batch
+            # collate_fn may return empty tensors if a whole batch is invalid/corrupt.
+            if features is None or labels is None:
+                continue
+            if int(features.numel()) == 0:
+                continue
+            if features.ndim > 1:  # Handle batch
                 all_features.append(features.numpy())
                 all_labels.append(labels.numpy())
         

@@ -87,11 +87,127 @@ class ROISelectorConfig(BaseSettings):
     )
     train_positive_subdir: str = Field(default="positive")
     train_negative_subdir: str = Field(default="negative")
+    train_negative_generated_subdir: str = Field(
+        default="negative_generated",
+        description=(
+            "Directory name under train_dataset_dir for newly generated negative patches. "
+            "Kept separate from train_negative_subdir to avoid overwriting manually labelled negatives."
+        ),
+    )
     train_model_output_path: Path = Field(default=Path("output/roi_selector/models/roi_svm.joblib"))
     train_image_extensions: tuple[str, ...] = Field(
         default=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".svs")
     )
     train_svm_c: float = Field(default=1.0, gt=0.0)
+
+    # --- Benchmark (Holdout patches, excluded from training) ---
+    benchmark_dir: Path = Field(
+        default=Path("output/roi_selector/benchmark"),
+        description="Directory to store benchmark/holdout patches and their index CSV.",
+    )
+    benchmark_exclude_from_training: bool = Field(
+        default=True,
+        description="If true, automatically exclude benchmark source patches from SVM training.",
+    )
+    benchmark_archive_subdir: str = Field(
+        default="holdout_removed",
+        description=(
+            "Subdirectory under train_dataset_dir where benchmark source patches are moved when pruning. "
+            "This avoids deleting data while ensuring training directories no longer contain holdout samples."
+        ),
+    )
+
+    neg_avoid_benchmark: bool = Field(
+        default=True,
+        description=(
+            "If true, negative sampling avoids generating patches that overlap benchmark rectangles for the same WSI."
+        ),
+    )
+
+    # --- Negative Sampling (Training Data) ---
+    neg_total_target_count: int = Field(
+        default=600,
+        ge=1,
+        description="Target number of negative patches to generate.",
+    )
+    neg_max_workers: int = Field(
+        default=16,
+        ge=1,
+        description="Max processes for negative sampling (kept modest to reduce WSI I/O contention).",
+    )
+    neg_attempts_per_slide: int = Field(
+        default=500,
+        ge=1,
+        description="How many random samples to try per opened slide before closing it.",
+    )
+    neg_attempts_multiplier: int = Field(
+        default=5000,
+        ge=1,
+        description="Total attempts is max(target_count * multiplier, 10000).",
+    )
+    neg_max_cell_count: int = Field(
+        default=20,
+        ge=0,
+        description="Negative acceptance threshold: blob count must be below this.",
+    )
+    neg_max_cell_ratio: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Negative acceptance threshold: segmented nuclear area ratio must be below this.",
+    )
+    neg_max_dark_ratio: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Negative acceptance threshold: dark pixel ratio must be below this.",
+    )
+
+    neg_clean_generated_output_dir: bool = Field(
+        default=False,
+        description=(
+            "If true, remove the generated negative output directory before sampling. "
+            "This never touches train_negative_subdir (the manually-labelled negatives)."
+        ),
+    )
+
+    # --- Negative Filter (Deep Learning Assisted) ---
+    neg_filter_dl_enabled: bool = Field(
+        default=False,
+        description=(
+            "If true, apply a deep-learning negative-filter model to reject suspicious patches during negative sampling."
+        ),
+    )
+    neg_filter_dl_model_path: Path = Field(
+        default=Path("output/roi_selector/models/neg_filter_dl.pt"),
+        description="Path to a trained deep-learning negative-filter model (saved by torch).",
+    )
+    neg_filter_dl_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Reject patch if DL P(suspicious) >= threshold.",
+    )
+    neg_filter_dl_input_size: int = Field(
+        default=224,
+        ge=64,
+        description="Input size (pixels) used by the DL negative filter model.",
+    )
+    neg_filter_dl_epochs: int = Field(
+        default=8,
+        ge=1,
+        description="Training epochs for DL negative filter.",
+    )
+    neg_filter_dl_batch_size: int = Field(
+        default=32,
+        ge=1,
+        description="Training batch size for DL negative filter.",
+    )
+    neg_filter_dl_lr: float = Field(
+        default=1e-3,
+        gt=0.0,
+        description="Training learning rate for DL negative filter.",
+    )
 
     # --- Inference ---
     infer_wsi_dir: Path = Field(
@@ -111,6 +227,28 @@ class ROISelectorConfig(BaseSettings):
     infer_exclude_border: int = Field(default=1000, ge=0)
     infer_top_n: int = Field(default=4, ge=1)
     infer_save_patches: bool = Field(default=True)
+    infer_scan_magnification: float = Field(
+        default=10.0,
+        description=(
+            "Magnification used to scan WSIs during ROI selection (paper uses 10x). "
+            "This controls the OpenSlide level used for sliding-window scanning."
+        ),
+    )
+    infer_roi_size_40x: int = Field(
+        default=5657,
+        ge=256,
+        description=(
+            "ROI side length (pixels) at 40x corresponding to ~10 HPF (paper uses 5657). "
+            "Used to derive the scanning window size at infer_scan_magnification."
+        ),
+    )
+    infer_save_full_roi_40x: bool = Field(
+        default=False,
+        description=(
+            "If true, also save the full ROI crop at level-0 resolution sized according to infer_roi_size_40x. "
+            "This can be large on disk."
+        ),
+    )
     infer_max_images: int | None = Field(default=None)
 
     # --- Shared Feature Config ---
