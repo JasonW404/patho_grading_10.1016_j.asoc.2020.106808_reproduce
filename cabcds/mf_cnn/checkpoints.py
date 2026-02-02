@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pickle
+
 import torch
 
 from cabcds.mf_cnn.cnn import CNNSeg, CNNSegLegacy
@@ -29,6 +31,28 @@ def _extract_model_state(payload: object) -> dict[str, torch.Tensor]:
         if isinstance(state, dict):
             return state
     raise ValueError("Unexpected checkpoint format (expected dict with model_state/state_dict)")
+
+
+def _torch_load_compat(*, path: Path, map_location: str | torch.device) -> object:
+    """Load a torch checkpoint across PyTorch versions.
+
+    PyTorch 2.6 changed `torch.load` default `weights_only` to True. Older
+    checkpoints that include non-tensor objects (e.g., `pathlib.Path` inside a
+    config dict) may fail to load with `weights_only=True`.
+
+    For checkpoints produced locally by this repo (trusted source), we retry
+    with `weights_only=False` when needed.
+    """
+
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as e:
+        # Retry for trusted local checkpoints.
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            # Older torch versions do not support `weights_only`.
+            raise e
 
 
 def load_cnn_seg_from_checkpoint(
@@ -46,7 +70,7 @@ def load_cnn_seg_from_checkpoint(
         A CNNSeg (new) or CNNSegLegacy (old) instance with weights loaded.
     """
 
-    payload = torch.load(Path(checkpoint_path), map_location=map_location)
+    payload = _torch_load_compat(path=Path(checkpoint_path), map_location=map_location)
     state = _extract_model_state(payload)
 
     # Variant detection by key pattern:

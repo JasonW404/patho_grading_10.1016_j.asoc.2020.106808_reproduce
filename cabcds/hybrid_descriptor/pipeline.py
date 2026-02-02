@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import pickle
 from pathlib import Path
 from typing import Callable, Iterable, cast
 
@@ -24,6 +25,24 @@ from cabcds.hybrid_descriptor.descriptor import HybridDescriptorBuilder, RoiMetr
 from cabcds.mf_cnn.cnn import CNNDet
 from cabcds.mf_cnn.mitosis_segmentation_net import CNNSeg
 from cabcds.mf_cnn.roi_scoring_net import RoiScoringNet
+
+
+def _torch_load_compat(path: str, *, map_location: torch.device) -> object:
+    """Load a torch checkpoint across PyTorch versions.
+
+    PyTorch 2.6 changed `torch.load` default `weights_only` to True, which can
+    fail for checkpoints that embed non-tensor objects.
+
+    For checkpoints produced locally by this repo (trusted), retry with
+    `weights_only=False`.
+    """
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as e:
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            raise e
 
 
 @dataclass(frozen=True)
@@ -289,7 +308,7 @@ def _load_segmentation_model(
     if config.segmentation_model_path is None:
         return None
     model = CNNSeg(pretrained=False)
-    payload = torch.load(config.segmentation_model_path, map_location=device)
+    payload = _torch_load_compat(str(config.segmentation_model_path), map_location=device)
     state: dict[str, torch.Tensor]
     if isinstance(payload, dict) and "model_state" in payload:
         state = payload["model_state"]
@@ -310,7 +329,7 @@ def _load_detection_model(
     if config.detection_model_path is None:
         return None
     model = CNNDet(pretrained=False)
-    payload = torch.load(config.detection_model_path, map_location=device)
+    payload = _torch_load_compat(str(config.detection_model_path), map_location=device)
     state: dict[str, torch.Tensor]
     if isinstance(payload, dict) and "model_state" in payload:
         state = payload["model_state"]
@@ -331,7 +350,7 @@ def _load_roi_scoring_model(
     if config.roi_scoring_model_path is None:
         return None
     model = RoiScoringNet(pretrained=False)
-    payload = torch.load(config.roi_scoring_model_path, map_location=device)
+    payload = _torch_load_compat(str(config.roi_scoring_model_path), map_location=device)
     state: dict[str, torch.Tensor]
     if isinstance(payload, dict) and "model_state" in payload:
         state = payload["model_state"]

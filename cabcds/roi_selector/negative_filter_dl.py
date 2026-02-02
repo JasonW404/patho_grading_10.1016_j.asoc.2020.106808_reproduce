@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -246,7 +247,13 @@ def load_negative_filter_dl_model(path: Path, *, device: str | None = None) -> D
     import torch.nn as nn
 
     path = Path(path).expanduser().resolve()
-    payload = torch.load(path, map_location="cpu")
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError as e:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            raise e
     input_size = int(payload.get("input_size", 224))
 
     class SmallCnn(nn.Module):

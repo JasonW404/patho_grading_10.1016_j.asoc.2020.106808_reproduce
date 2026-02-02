@@ -657,7 +657,7 @@ def _train_seg(
         avg = running / max(1, steps)
         logger.info("CNN_seg epoch done: epoch=%d avg_loss=%.4f steps=%d", epoch + 1, avg, steps)
 
-    torch.save({"model_state": model.state_dict(), "config": cfg.model_dump()}, checkpoint_path)
+    torch.save({"model_state": model.state_dict(), "config": cfg.model_dump(mode="json")}, checkpoint_path)
     logger.info("Saved CNN_seg checkpoint: %s", str(checkpoint_path))
 
 
@@ -748,7 +748,7 @@ def _train_det(
         acc = correct / max(1, total)
         logger.info("CNN_det epoch done: epoch=%d avg_loss=%.4f acc=%.3f steps=%d", epoch + 1, avg, float(acc), steps)
 
-    torch.save({"model_state": model.state_dict(), "config": cfg.model_dump()}, checkpoint_path)
+    torch.save({"model_state": model.state_dict(), "config": cfg.model_dump(mode="json")}, checkpoint_path)
     logger.info("Saved CNN_det checkpoint: %s", str(checkpoint_path))
 
 
