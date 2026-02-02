@@ -100,6 +100,19 @@ This uses [cabcds/roi_selector/inference.py](cabcds/roi_selector/inference.py) a
 
 - `output/roi_selector/outputs/reports/stage_two_roi_selection.csv`
 
+Preview patches (feature-size) are written under:
+
+- `output/roi_selector/outputs/patches/`
+
+This repo supports a cleaner split layout (recommended):
+
+- `output/roi_selector/outputs/patches/train/TUPAC-TR-xxx/roi_..png`
+- `output/roi_selector/outputs/patches/test/TUPAC-TE-xxx/roi_..png`
+
+You can restructure an existing mixed folder using:
+
+- `uv run python -m cabcds.roi_selector.report_export --restructure-split`
+
 ## Label Studio loop (optional)
 
 ### Train negative filter (DL)
@@ -117,6 +130,97 @@ Model artifact:
 - ROI selector code: [cabcds/roi_selector](cabcds/roi_selector)
 - WSI scoring pipeline: [cabcds/wsi_scorer](cabcds/wsi_scorer)
 - Hybrid descriptor: [cabcds/hybrid_descriptor](cabcds/hybrid_descriptor)
+
+## MF-CNN (Stage 2, WIP)
+
+This repo includes reference implementations of the MF-CNN submodules:
+
+- `CNN_seg` (VGG16-FCN): mitosis candidate segmentation (trained from centroid annotations)
+- `CNN_det` (AlexNet): mitosis / non-mitosis candidate classification
+- `CNN_global` (AlexNet): 3-class proliferation score for ROI patches
+
+### Baseline smoke test (no extra downloads)
+
+The baseline uses only the data already present under `dataset/`.
+
+- Run a quick forward+backward smoke test for `CNN_seg` + `CNN_det`:
+	- `uv run python -m cabcds.mf_cnn --smoke`
+
+### Train `CNN_seg` (mitosis candidate segmentation)
+
+This trains a VGG16-FCN segmentation model from centroid annotations in the auxiliary mitosis dataset.
+
+- `uv run python -m cabcds.mf_cnn --train-seg --device cpu --batch-size 1 --seg-epochs 1 --seg-max-steps 50`
+
+Checkpoint output:
+
+- `data/mf_cnn/models/cnn_seg.pt`
+
+### Prepare `CNN_det` patches using `CNN_seg` candidates (paper-aligned)
+
+This runs the trained `CNN_seg` on auxiliary tiles, converts predicted masks into connected-component candidates,
+and writes a disk-backed patch dataset + index CSV for training `CNN_det`.
+
+- `uv run python -m cabcds.mf_cnn --prepare-det --device cpu --det-seg-checkpoint data/mf_cnn/models/cnn_seg.pt`
+
+Outputs:
+
+- `data/mf_cnn/det_patches/index.csv`
+
+### Train `CNN_det` (mitosis / non-mitosis)
+
+- `uv run python -m cabcds.mf_cnn --train-det --device cpu --batch-size 16 --det-epochs 1 --det-max-steps 200 --det-index-csv data/mf_cnn/det_patches/index.csv`
+
+Checkpoint output:
+
+- `data/mf_cnn/models/cnn_det.pt`
+
+### Prepare `CNN_global` patches (TUPAC train WSIs)
+
+This extracts `512x512` patches with overlap `80` from `dataset/train/*.svs` and writes:
+
+- patches under `data/mf_cnn/global_patches/<slide_id>/*.png`
+- an index CSV at `data/mf_cnn/global_patches/index.csv`
+
+Safe-by-default example (process 1 slide, extract 100 patches max):
+
+- `uv run python -m cabcds.mf_cnn --prepare-global --max-slides 1 --max-patches-per-slide 100`
+
+Resume is enabled by default (uses a per-slide `.done` marker). To re-run from scratch:
+
+- delete `data/mf_cnn/global_patches/` or pass `--no-resume`
+
+### Train `CNN_global`
+
+After preparing patches and `index.csv`, run a short training (safe-by-default example):
+
+- `uv run python -m cabcds.mf_cnn --train-global --global-epochs 1 --global-max-steps 10`
+
+Slide-level validation split (recommended to avoid leakage):
+
+- `uv run python -m cabcds.mf_cnn --train-global --global-epochs 1 --global-val-fraction 0.2`
+
+Data augmentation (enabled by default):
+
+- Disable: `uv run python -m cabcds.mf_cnn --train-global --no-global-augment`
+- Adjust jitter: `uv run python -m cabcds.mf_cnn --train-global --global-color-jitter 0.05`
+
+Checkpoint output:
+
+- `data/mf_cnn/models/cnn_global.pt`
+
+### Optional external mitosis datasets (placeholders)
+
+The paper improves `CNN_seg` generalization by adding external mitosis datasets
+(e.g. MITOS12 / MITOS14 / AMIDA13(+1)). This repo reserves the following paths:
+
+- `dataset/external/mitos12/`
+- `dataset/external/mitos14/`
+
+They are **not required** to run the baseline. If you place external centroid-style
+tiles on disk, you can enable mixed sampling via:
+
+- `CABCDS_MFCNN_USE_EXTERNAL_MITOSIS_DATASETS=true`
 
 ## Troubleshooting
 

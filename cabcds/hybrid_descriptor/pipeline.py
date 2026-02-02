@@ -14,8 +14,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from cabcds.roi_selector.data_loader.blue_ratio import compute_blob_stats
-from cabcds.roi_selector.data_loader.io import load_rgb_image
+from cabcds.roi_selector.utils.blue_ratio import compute_blob_stats
+from cabcds.roi_selector.utils.io import load_rgb_image
 from cabcds.hybrid_descriptor.config import (
     HybridDescriptorConfig,
     HybridDescriptorInferenceConfig,
@@ -289,7 +289,14 @@ def _load_segmentation_model(
     if config.segmentation_model_path is None:
         return None
     model = CNNSeg(pretrained=False)
-    state = torch.load(config.segmentation_model_path, map_location=device)
+    payload = torch.load(config.segmentation_model_path, map_location=device)
+    state: dict[str, torch.Tensor]
+    if isinstance(payload, dict) and "model_state" in payload:
+        state = payload["model_state"]
+    elif isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+    else:
+        state = payload
     model.load_state_dict(state)
     model.to(device)
     return model
@@ -303,7 +310,14 @@ def _load_detection_model(
     if config.detection_model_path is None:
         return None
     model = CNNDet(pretrained=False)
-    state = torch.load(config.detection_model_path, map_location=device)
+    payload = torch.load(config.detection_model_path, map_location=device)
+    state: dict[str, torch.Tensor]
+    if isinstance(payload, dict) and "model_state" in payload:
+        state = payload["model_state"]
+    elif isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+    else:
+        state = payload
     model.load_state_dict(state)
     model.to(device)
     return model
@@ -317,7 +331,14 @@ def _load_roi_scoring_model(
     if config.roi_scoring_model_path is None:
         return None
     model = RoiScoringNet(pretrained=False)
-    state = torch.load(config.roi_scoring_model_path, map_location=device)
+    payload = torch.load(config.roi_scoring_model_path, map_location=device)
+    state: dict[str, torch.Tensor]
+    if isinstance(payload, dict) and "model_state" in payload:
+        state = payload["model_state"]
+    elif isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+    else:
+        state = payload
     model.load_state_dict(state)
     model.to(device)
     return model

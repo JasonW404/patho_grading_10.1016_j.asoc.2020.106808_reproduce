@@ -50,7 +50,7 @@ class HybridDescriptorInferenceConfig(BaseSettings):
         env_nested_delimiter = "__"
         frozen = True
 
-    roi_patches_dir: str = Field(default="data/roi_selector/outputs/patches")
+    roi_patches_dir: str = Field(default="output/roi_selector/outputs/patches")
     output_dir: str = Field(default="data/hybrid_descriptor")
     segmentation_model_path: str | None = Field(default=None)
     detection_model_path: str | None = Field(default=None)

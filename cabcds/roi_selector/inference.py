@@ -277,7 +277,12 @@ class RoiSelector:
             # Optionally also save the full ROI crop at level 0.
             # (Preview patches are saved by _select_for_image to avoid double-writing.)
             if bool(self.config.infer_save_patches) and bool(self.config.infer_save_full_roi_40x) and selected:
-                out_dir = self.config.infer_output_dir / "patches_full_40x" / image_path.stem
+                full_root = self.config.infer_output_dir / "patches_full_40x"
+                if (full_root / "train").exists() or (full_root / "test").exists():
+                    split_name = "test" if self.config.infer_wsi_dir.name == "test" else "train"
+                    out_dir = full_root / split_name / image_path.stem
+                else:
+                    out_dir = full_root / image_path.stem
                 out_dir.mkdir(parents=True, exist_ok=True)
                 for index, cand in enumerate(selected, start=1):
                     try:
@@ -313,7 +318,14 @@ class RoiSelector:
             candidates: Selected ROI candidates.
         """
 
-        output_dir = self.config.infer_output_dir / "patches" / image_path.stem
+        patches_root = self.config.infer_output_dir / "patches"
+        # If the user has split the patches directory into train/test, keep writing there.
+        # This preserves backward compatibility with the original flat layout.
+        if (patches_root / "train").exists() or (patches_root / "test").exists():
+            split_name = "test" if self.config.infer_wsi_dir.name == "test" else "train"
+            output_dir = patches_root / split_name / image_path.stem
+        else:
+            output_dir = patches_root / image_path.stem
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for index, candidate in enumerate(candidates, start=1):

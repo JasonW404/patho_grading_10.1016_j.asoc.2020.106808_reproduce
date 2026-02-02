@@ -15,3 +15,8 @@ dataset/
 artifact/
 output/
 temp/
+
+# Local run artifacts (do not commit)
+data/
+logs/
+fusion_result.json

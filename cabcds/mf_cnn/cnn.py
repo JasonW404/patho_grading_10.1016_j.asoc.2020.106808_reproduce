@@ -1,4 +1,14 @@
-"""The CNNs used in MF-CNN"""
+"""Torchvision-based CNNs used in MF-CNN.
+
+Notes
+-----
+The original paper uses:
+- `CNN_seg`: VGG16-VD converted to FCN, with transposed-conv upsampling and skip connections.
+- `CNN_det`: AlexNet binary classifier on resized 227x227 crops.
+- `CNN_global`: AlexNet 3-class classifier on resized 227x227 ROI patches.
+
+This module keeps the architecture lightweight and focused on model definitions.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +45,8 @@ class CNNSeg(nn.Module):
     def __init__(self, num_classes: int = 2, pretrained: bool = True) -> None:
         super().__init__()
 
+        self.num_classes = int(num_classes)
+
         # Load pretrained VGG16 model
         vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None)\
                       .features
@@ -47,29 +59,34 @@ class CNNSeg(nn.Module):
         self.stage4 = vgg16_feature[17:24] # P4 Conv + ReLU (x3) + Pool => 32x32
         self.stage5 = vgg16_feature[24:31] # P5 Conv + ReLU (x3) + Pool => 16x16
 
-        # Bottleneck: "Red" rectangles. (Fig. 8. CNN_seg)
+        # Bottleneck: FCN-style replacement of VGG's FC layers.
+        # Classic FCN (and many VGG16-to-FCN conversions) replace:
+        # - fc6 with a 7x7 conv
+        # - fc7 with a 1x1 conv
+        # followed by a per-pixel class score conv.
+        # We keep spatial resolution by using padding=3 on the 7x7 conv.
         self.fc_block = nn.Sequential(
-            nn.Conv2d(512, 4096, kernel_size=1),
+            nn.Conv2d(512, 4096, kernel_size=7, padding=3),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.5),
             nn.Conv2d(4096, 4096, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(4096, 2, kernel_size=1) # Corresponds to FC3 => 2 classes
+            nn.Dropout2d(p=0.5),
+            nn.Conv2d(4096, self.num_classes, kernel_size=1),
         )
 
         # Decoder: Up Sampling + Skip Connections
         
-        self.conv_trans_1 = nn.ConvTranspose2d(2, 2, kernel_size=4, stride=2, padding=1)  # 16 -> 32
-        self.conv_trans_2 = nn.ConvTranspose2d(2, 2, kernel_size=4, stride=2, padding=1)  # 32 -> 64
-        self.conv_trans_3 = nn.ConvTranspose2d(2, 2, kernel_size=4, stride=2, padding=1)  # 64 -> 128
-        self.conv_trans_4 = nn.ConvTranspose2d(2, 2, kernel_size=8, stride=4, padding=2)  # 128 -> 512
+        self.conv_trans_1 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)  # 16 -> 32
+        self.conv_trans_2 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)  # 32 -> 64
+        self.conv_trans_3 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)  # 64 -> 128
+        self.conv_trans_4 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=8, stride=4, padding=2)  # 128 -> 512
         
-        self.upsample_1 = nn.Conv2d(512, 2, kernel_size=1)  # [P4 (F:512) -> + CONV-TRAN1]
-        self.upsample_2 = nn.Conv2d(256, 2, kernel_size=1)  # [P3 (F:256) -> + CONV-TRAN2]
-        self.upsample_3 = nn.Conv2d(128, 2, kernel_size=1)  # [P2 (F:128) -> + CONV-TRAN3]
+        self.upsample_1 = nn.Conv2d(512, self.num_classes, kernel_size=1)  # [P4 (F:512) -> + CONV-TRAN1]
+        self.upsample_2 = nn.Conv2d(256, self.num_classes, kernel_size=1)  # [P3 (F:256) -> + CONV-TRAN2]
+        self.upsample_3 = nn.Conv2d(128, self.num_classes, kernel_size=1)  # [P2 (F:128) -> + CONV-TRAN3]
 
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> SegmentationOutput:
         # Encoder
         p1 = self.stage1(x)
         p2 = self.stage2(p1)
@@ -78,16 +95,73 @@ class CNNSeg(nn.Module):
         p5 = self.stage5(p4)
 
         # Bottleneck
-        fc3 = self.fc_block(p5) # 16x16
+        fc3 = self.fc_block(p5)  # 16x16
 
         # Decoder (fusing according to red arrows in the figure)
         out = self.conv_trans_1(fc3) + self.upsample_1(p4)  # SKIP 1
         out = self.conv_trans_2(out) + self.upsample_2(p3)  # SKIP 2
         out = self.conv_trans_3(out) + self.upsample_3(p2)  # SKIP 3
         
-        out = self.conv_trans_4(out)                        
-        
-        return self.softmax(out)
+        logits = self.conv_trans_4(out)
+
+        # Return logits (for CrossEntropyLoss) and encoder features for downstream use.
+        return SegmentationOutput(logits=logits, features=(p1, p2, p3, p4, p5))
+
+
+class CNNSegLegacy(nn.Module):
+    """Legacy CNN_seg variant.
+
+    This matches an earlier implementation that used a lightweight 1x1-conv
+    approximation of VGG's FC layers (i.e., kernel_size=1 throughout).
+
+    Kept to load older checkpoints that are not compatible with the current
+    FCN-like 7x7/1x1 head.
+    """
+
+    def __init__(self, num_classes: int = 2, pretrained: bool = True) -> None:
+        super().__init__()
+
+        self.num_classes = int(num_classes)
+
+        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None).features
+        vgg16_feature = cast(nn.Sequential, vgg16)
+
+        self.stage1 = vgg16_feature[:5]
+        self.stage2 = vgg16_feature[5:10]
+        self.stage3 = vgg16_feature[10:17]
+        self.stage4 = vgg16_feature[17:24]
+        self.stage5 = vgg16_feature[24:31]
+
+        self.fc_block = nn.Sequential(
+            nn.Conv2d(512, 4096, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(4096, 4096, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(4096, self.num_classes, kernel_size=1),
+        )
+
+        self.conv_trans_1 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)
+        self.conv_trans_2 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)
+        self.conv_trans_3 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=4, stride=2, padding=1)
+        self.conv_trans_4 = nn.ConvTranspose2d(self.num_classes, self.num_classes, kernel_size=8, stride=4, padding=2)
+
+        self.upsample_1 = nn.Conv2d(512, self.num_classes, kernel_size=1)
+        self.upsample_2 = nn.Conv2d(256, self.num_classes, kernel_size=1)
+        self.upsample_3 = nn.Conv2d(128, self.num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> SegmentationOutput:
+        p1 = self.stage1(x)
+        p2 = self.stage2(p1)
+        p3 = self.stage3(p2)
+        p4 = self.stage4(p3)
+        p5 = self.stage5(p4)
+
+        fc3 = self.fc_block(p5)
+        out = self.conv_trans_1(fc3) + self.upsample_1(p4)
+        out = self.conv_trans_2(out) + self.upsample_2(p3)
+        out = self.conv_trans_3(out) + self.upsample_3(p2)
+        logits = self.conv_trans_4(out)
+        return SegmentationOutput(logits=logits, features=(p1, p2, p3, p4, p5))
 
 
 class CNNDet(nn.Module):
@@ -120,5 +194,5 @@ class CNNDet(nn.Module):
 
 class CNNGlobal(CNNDet):
     """CNN_Global: AlexNet-based CNN for ROI scoring."""
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True) -> None:
         super().__init__(num_classes=3, pretrained=pretrained)
