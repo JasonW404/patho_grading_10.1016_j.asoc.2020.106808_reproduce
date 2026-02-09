@@ -132,6 +132,7 @@ def prepare_cnn_det_patches_from_aux_zips(
     max_tiles: int | None = None,
     max_candidates_per_tile: int = 200,
     max_negatives_per_positive: int = 3,
+    match_radius: int = 30,
     seed: int = 1337,
 ) -> list[DetPatchIndexRow]:
     """Prepare CNN_det training patches using CNN_seg candidates.
@@ -171,11 +172,12 @@ def prepare_cnn_det_patches_from_aux_zips(
     rows: list[DetPatchIndexRow] = []
 
     logger.info(
-        "Preparing CNN_det patches: tiles=%d crop=%d max_cand=%d max_neg_per_pos=%d out=%s",
+        "Preparing CNN_det patches: tiles=%d crop=%d max_cand=%d max_neg_per_pos=%d match_r=%d out=%s",
         len(tiles),
         int(crop_size),
         int(max_candidates_per_tile),
         int(max_negatives_per_positive),
+        int(match_radius),
         str(out_root),
     )
 
@@ -205,13 +207,32 @@ def prepare_cnn_det_patches_from_aux_zips(
         regions.sort(key=lambda r: float(r.area), reverse=True)
         regions = regions[: int(max_candidates_per_tile)]
 
-        # Determine which labels are positive (contain a GT centroid).
+        # Determine which labels are positive.
+        #
+        # The paper labels a candidate blob as positive if it contains a GT
+        # centroid. In practice, CNN_seg predictions can be slightly offset
+        # from the pathologist centroid, so we allow a small matching radius.
         positive_labels: set[int] = set()
         for gx, gy in centroids:
             if 0 <= gy < h and 0 <= gx < w:
-                lab = int(labeled[int(gy), int(gx)])
-                if lab > 0:
-                    positive_labels.add(lab)
+                gx_i, gy_i = int(gx), int(gy)
+                if int(match_radius) <= 0:
+                    lab = int(labeled[gy_i, gx_i])
+                    if lab > 0:
+                        positive_labels.add(lab)
+                    continue
+
+                r = int(match_radius)
+                y0 = max(0, gy_i - r)
+                y1 = min(h, gy_i + r + 1)
+                x0 = max(0, gx_i - r)
+                x1 = min(w, gx_i + r + 1)
+                window = labeled[y0:y1, x0:x1]
+                labs = np.unique(window)
+                for lab in labs:
+                    lab_i = int(lab)
+                    if lab_i > 0:
+                        positive_labels.add(lab_i)
 
         positives: list[tuple[np.ndarray, int, int, int]] = []
         negatives: list[tuple[np.ndarray, int, int, int]] = []

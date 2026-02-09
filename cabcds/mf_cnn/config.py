@@ -38,7 +38,10 @@ class MfcCnnConfig(BaseSettings):
     # `CNN_seg` generalization, but they are not required to run a baseline.
     external_dataset_dir: Path = Field(default=Path("dataset/external"))
     mitos12_dir: Path = Field(default=Path("dataset/external/mitos12"))
-    mitos14_dir: Path = Field(default=Path("dataset/external/mitos14"))
+    # This repo commonly stores the MITOS14 downloads under `dataset/MITOS14/`.
+    # Note: the training code expects the archives to be extracted so that
+    # image files and centroid CSV/TXT files exist on disk.
+    mitos14_dir: Path = Field(default=Path("dataset/MITOS14"))
     use_external_mitosis_datasets: bool = Field(default=False)
 
     # Mitosis auxiliary dataset zips (as included in this repo's dataset folder)
@@ -81,4 +84,40 @@ def load_mfc_cnn_config() -> MfcCnnConfig:
         MfcCnnConfig instance.
     """
 
-    return MfcCnnConfig()
+    cfg = MfcCnnConfig()
+
+    # Auto-detect alternate layouts used in some reproductions.
+    # New layout:
+    #   dataset/tupac16/{train,test,auxiliary_dataset_*}
+    #   dataset/mitos14/{train,test}
+    # Old layout (repo default):
+    #   dataset/{train,test,auxiliary_dataset_*}
+    #   dataset/external/mitos14
+    base = cfg.dataset_dir
+    tupac16_root = base / "tupac16"
+    mitos14_root = base / "mitos14"
+
+    overrides: dict[str, object] = {}
+    if tupac16_root.exists() and tupac16_root.is_dir():
+        overrides.update(
+            {
+                "tupac_train_dir": tupac16_root / "train",
+                "tupac_test_dir": tupac16_root / "test",
+                "tupac_train_ground_truth_csv": tupac16_root / "train" / "ground_truth.csv",
+                "tupac_aux_roi_dir": tupac16_root / "auxiliary_dataset_roi",
+                "tupac_aux_mitoses_dir": tupac16_root / "auxiliary_dataset_mitoses",
+            }
+        )
+    if mitos14_root.exists() and mitos14_root.is_dir():
+        overrides.update(
+            {
+                "external_dataset_dir": base,
+                "mitos14_dir": mitos14_root,
+            }
+        )
+
+    if not overrides:
+        return cfg
+
+    # Merge overrides into the loaded settings (env vars still win).
+    return MfcCnnConfig(**{**cfg.model_dump(), **overrides})

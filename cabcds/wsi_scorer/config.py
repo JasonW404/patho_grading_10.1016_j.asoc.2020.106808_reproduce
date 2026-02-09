@@ -31,6 +31,7 @@ class WsiScorerConfig(BaseSettings):
     model_output_path: Path = Field(default=Path("data/wsi_scorer/models/wsi_svm.joblib"))
     report_dir: Path = Field(default=Path("data/wsi_scorer/reports"))
     svm_c: float = Field(default=0.1, gt=0.0)
+    svm_kernel: str = Field(default="rbf")
     cv_folds: int = Field(default=10, ge=2)
     decision_function_shape: str = Field(default="ovo")
 

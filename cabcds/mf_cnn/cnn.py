@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torchvision import models
 
 
@@ -87,6 +88,11 @@ class CNNSeg(nn.Module):
         self.upsample_3 = nn.Conv2d(128, self.num_classes, kernel_size=1)  # [P2 (F:128) -> + CONV-TRAN3]
 
     def forward(self, x: torch.Tensor) -> SegmentationOutput:
+        def _resize_like(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            if tensor.shape[-2:] == ref.shape[-2:]:
+                return tensor
+            return F.interpolate(tensor, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
         # Encoder
         p1 = self.stage1(x)
         p2 = self.stage2(p1)
@@ -98,11 +104,19 @@ class CNNSeg(nn.Module):
         fc3 = self.fc_block(p5)  # 16x16
 
         # Decoder (fusing according to red arrows in the figure)
-        out = self.conv_trans_1(fc3) + self.upsample_1(p4)  # SKIP 1
-        out = self.conv_trans_2(out) + self.upsample_2(p3)  # SKIP 2
-        out = self.conv_trans_3(out) + self.upsample_3(p2)  # SKIP 3
+        skip1 = self.upsample_1(p4)
+        out = _resize_like(self.conv_trans_1(fc3), skip1) + skip1  # SKIP 1
+
+        skip2 = self.upsample_2(p3)
+        out = _resize_like(self.conv_trans_2(out), skip2) + skip2  # SKIP 2
+
+        skip3 = self.upsample_3(p2)
+        out = _resize_like(self.conv_trans_3(out), skip3) + skip3  # SKIP 3
         
         logits = self.conv_trans_4(out)
+        # Ensure logits match input size for loss computation and downstream mask extraction.
+        if logits.shape[-2:] != x.shape[-2:]:
+            logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
         # Return logits (for CrossEntropyLoss) and encoder features for downstream use.
         return SegmentationOutput(logits=logits, features=(p1, p2, p3, p4, p5))
@@ -150,6 +164,11 @@ class CNNSegLegacy(nn.Module):
         self.upsample_3 = nn.Conv2d(128, self.num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> SegmentationOutput:
+        def _resize_like(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            if tensor.shape[-2:] == ref.shape[-2:]:
+                return tensor
+            return F.interpolate(tensor, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
         p1 = self.stage1(x)
         p2 = self.stage2(p1)
         p3 = self.stage3(p2)
@@ -157,10 +176,15 @@ class CNNSegLegacy(nn.Module):
         p5 = self.stage5(p4)
 
         fc3 = self.fc_block(p5)
-        out = self.conv_trans_1(fc3) + self.upsample_1(p4)
-        out = self.conv_trans_2(out) + self.upsample_2(p3)
-        out = self.conv_trans_3(out) + self.upsample_3(p2)
+        skip1 = self.upsample_1(p4)
+        out = _resize_like(self.conv_trans_1(fc3), skip1) + skip1
+        skip2 = self.upsample_2(p3)
+        out = _resize_like(self.conv_trans_2(out), skip2) + skip2
+        skip3 = self.upsample_3(p2)
+        out = _resize_like(self.conv_trans_3(out), skip3) + skip3
         logits = self.conv_trans_4(out)
+        if logits.shape[-2:] != x.shape[-2:]:
+            logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
         return SegmentationOutput(logits=logits, features=(p1, p2, p3, p4, p5))
 
 

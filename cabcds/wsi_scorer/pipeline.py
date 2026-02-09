@@ -169,7 +169,7 @@ def _build_model(config: WsiScorerConfig) -> Pipeline:
                 "svm",
                 SVC(
                     C=config.svm_c,
-                    kernel="linear",
+                    kernel=config.svm_kernel,
                     decision_function_shape=config.decision_function_shape,
                 ),
             ),

@@ -119,6 +119,7 @@ def _read_centroids_from_path(path: Path) -> list[tuple[int, int]]:
 	"""Read centroid file from disk.
 
 	We accept a simple CSV/TXT format: one "x,y" pair per line.
+	Additional columns (e.g. probability) are ignored.
 	"""
 	content = Path(path).read_text(encoding="utf-8", errors="replace").strip()
 	if not content:
@@ -129,7 +130,7 @@ def _read_centroids_from_path(path: Path) -> list[tuple[int, int]]:
 		if not line:
 			continue
 		parts = line.split(",")
-		if len(parts) != 2:
+		if len(parts) < 2:
 			continue
 		x = int(float(parts[0]))
 		y = int(float(parts[1]))
@@ -137,10 +138,38 @@ def _read_centroids_from_path(path: Path) -> list[tuple[int, int]]:
 	return centroids
 
 
+def _index_mitos14_structure(root: Path) -> list[tuple[Path, Path]]:
+	"""Index specifically for MITOS14 directory structure.
+    
+    Structure:
+      .../frames/x40/image_id.tiff
+      .../mitosis/image_id_mitosis.csv
+    """
+	pairs: list[tuple[Path, Path]] = []
+	# Search for all x40 tiff frames
+	for image_path in root.rglob("frames/x40/*.tiff"):
+		# Check for corresponding mitosis csv in sibling 'mitosis' folder
+		# image_path: .../A03/frames/x40/A03_00Aa.tiff
+		# expected csv: .../A03/mitosis/A03_00Aa_mitosis.csv
+		
+		# Go up 2 levels from image to reach 'A03' folder
+		case_root = image_path.parent.parent.parent
+		mitosis_dir = case_root / "mitosis"
+		
+		csv_name = f"{image_path.stem}_mitosis.csv"
+		csv_path = mitosis_dir / csv_name
+		
+		if csv_path.exists():
+			pairs.append((image_path, csv_path))
+			
+	return pairs
+
+
 def _index_external_centroid_pairs(root: Path) -> list[tuple[Path, Path]]:
 	"""Index an external mitosis dataset stored on disk.
 
 	Expected (flexible) layouts that this function supports:
+	- MITOS14 specific structure (detected automatically)
 	- images anywhere under root (recursive)
 	- centroid files stored as CSV/TXT with the same stem as the image
 	  located either next to the image or under common annotation folders like
@@ -152,15 +181,44 @@ def _index_external_centroid_pairs(root: Path) -> list[tuple[Path, Path]]:
 	if not root.exists():
 		return []
 
+	# First, check for MITOS14 specific structure
+	mitos14_pairs = _index_mitos14_structure(root)
+	if mitos14_pairs:
+		mitos14_pairs.sort(key=lambda x: str(x[0]))
+		logger.info("Detected MITOS14 structure at %s: found %d pairs", str(root), len(mitos14_pairs))
+		return mitos14_pairs
+
+	def _zip_has_eocd(zip_path: Path) -> bool:
+		"""Heuristically validate a ZIP by checking for the EOCD marker.
+
+		Many interrupted downloads still start with a correct PK header, but are
+		missing the end-of-central-directory record ("PK\x05\x06").
+		"""
+		sig = b"PK\x05\x06"
+		try:
+			size = zip_path.stat().st_size
+			with zip_path.open("rb") as f:
+				f.seek(max(0, size - 1024 * 1024))
+				return f.read().rfind(sig) != -1
+		except OSError:
+			return False
+
 	image_exts = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 	ann_dirs = [root / "annotations", root / "annotation", root / "centroids", root / "labels"]
 
 	pairs: list[tuple[Path, Path]] = []
+	found_any_image = False
+	found_any_ann = False
 	for image_path in root.rglob("*"):
 		if not image_path.is_file():
 			continue
-		if image_path.suffix.lower() not in image_exts:
+		suffix = image_path.suffix.lower()
+		if suffix in {".csv", ".txt"}:
+			found_any_ann = True
+		if suffix not in image_exts:
 			continue
+
+		found_any_image = True
 
 		candidates = [
 			image_path.with_suffix(".csv"),
@@ -176,6 +234,35 @@ def _index_external_centroid_pairs(root: Path) -> list[tuple[Path, Path]]:
 		pairs.append((image_path, centroid_path))
 
 	pairs.sort(key=lambda x: str(x[0]))
+	if not pairs:
+		zip_files = list(root.glob("*.zip"))
+		if zip_files and not found_any_image:
+			bad = [p for p in zip_files if not _zip_has_eocd(p)]
+			if bad:
+				logger.warning(
+					"External mitosis dataset root '%s' contains %d ZIP(s), but %d look truncated/corrupt (missing EOCD). "
+					"Re-download them (with resume) before extracting.",
+					str(root),
+					len(zip_files),
+					len(bad),
+				)
+			else:
+				logger.warning(
+					"External mitosis dataset root '%s' contains ZIP files but no extracted images were found. "
+					"Extract the archives so images and centroid CSV/TXT files are on disk.",
+					str(root),
+				)
+			return []
+		if found_any_image and not found_any_ann:
+			logger.warning(
+				"External mitosis dataset root '%s' has images but no centroid CSV/TXT files were found; skipping.",
+				str(root),
+			)
+		elif not found_any_image:
+			logger.warning(
+				"External mitosis dataset root '%s' has no supported image files; skipping.",
+				str(root),
+			)
 	return pairs
 
 
@@ -503,16 +590,27 @@ class PreparedMitosisDetectionPatchDataset(Dataset[tuple[Tensor, Tensor]]):
 	def __init__(
 		self,
 		*,
-		index_csv: Path,
+		index_csv: Path | None = None,
+		rows: list[DetPatchIndexRow] | None = None,
 		output_size: int = 227,
 		normalize_imagenet: bool = True,
 	) -> None:
-		self.index_csv = Path(index_csv)
+		self.index_csv = Path(index_csv) if index_csv else None
 		self.output_size = int(output_size)
 		self.normalize_imagenet = bool(normalize_imagenet)
-		self._rows = read_det_patch_index(self.index_csv)
+		
+		if rows is not None:
+			self._rows = rows
+		elif self.index_csv is not None:
+			self._rows = read_det_patch_index(self.index_csv)
+		else:
+			raise ValueError("Either index_csv or rows must be provided")
+
 		if not self._rows:
-			raise ValueError(f"Empty CNN_det index: {self.index_csv}")
+			# warn but allow empty for edge cases? No, dataset should have data.
+			# But if a split is empty (e.g. test set too small), it might crash.
+			# Keeping original behavior of raising error for now, but maybe relax later.
+			raise ValueError(f"Empty CNN_det index.")
 
 	def __len__(self) -> int:  # noqa: D401
 		return len(self._rows)
@@ -698,6 +796,8 @@ def build_default_mf_cnn_train_loaders(
 	num_workers: int = 0,
 	seg_length: int = 10_000,
 	det_length: int = 20_000,
+	seg_augment: bool = True,
+	det_augment: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
 	"""Build segmentation and detection loaders from the mitosis auxiliary zips.
 
@@ -714,13 +814,19 @@ def build_default_mf_cnn_train_loaders(
 			", ".join(str(p) for p in existing),
 		)
 	elif config.use_external_mitosis_datasets:
+		# Allow users to enable any subset of supported external datasets.
+		external_roots = existing
+		if not external_roots:
+			raise FileNotFoundError(
+				"Requested external mitosis datasets, but none of these paths exist: "
+				+ ", ".join(str(p) for p in potential)
+			)
 		missing = [p for p in potential if not p.exists()]
 		if missing:
-			raise FileNotFoundError(
-				"Requested external mitosis datasets, but these paths do not exist: "
-				+ ", ".join(str(p) for p in missing)
+			logger.warning(
+				"Some external dataset paths do not exist and will be skipped: %s",
+				", ".join(str(p) for p in missing),
 			)
-		external_roots = existing
 
 	base = config.tupac_aux_mitoses_dir
 	image_zips = [base / rel for rel in config.mitoses_image_zip_parts]
@@ -735,6 +841,7 @@ def build_default_mf_cnn_train_loaders(
 		centroid_fallback_radius=config.centroid_fallback_radius,
 		length=seg_length,
 		seed=config.seed,
+		augment=bool(seg_augment),
 	)
 	det_ds = MitosisDetectionDataset(
 		image_zip_parts=image_zips,
@@ -744,6 +851,7 @@ def build_default_mf_cnn_train_loaders(
 		nuclei_min_area=config.nuclei_min_area,
 		length=det_length,
 		seed=config.seed,
+		augment=bool(det_augment),
 	)
 
 	seg_loader = DataLoader(seg_ds, batch_size=int(batch_size), shuffle=True, num_workers=int(num_workers))
