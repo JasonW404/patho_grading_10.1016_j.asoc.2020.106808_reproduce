@@ -558,6 +558,7 @@ class DetPatchIndexRow:
 	tile_id: str
 	cx: int
 	cy: int
+	is_gt_forced: int = 0
 
 
 def read_det_patch_index(index_csv: Path) -> list[DetPatchIndexRow]:
@@ -567,6 +568,7 @@ def read_det_patch_index(index_csv: Path) -> list[DetPatchIndexRow]:
 	with Path(index_csv).open("r", newline="") as f:
 		reader = csv.DictReader(f)
 		for row in reader:
+			is_gt_forced = int(float(row.get("is_gt_forced") or 0))
 			rows.append(
 				DetPatchIndexRow(
 					path=Path(row["path"]),
@@ -575,6 +577,7 @@ def read_det_patch_index(index_csv: Path) -> list[DetPatchIndexRow]:
 					tile_id=str(row.get("tile_id") or ""),
 					cx=int(float(row.get("cx") or 0)),
 					cy=int(float(row.get("cy") or 0)),
+					is_gt_forced=int(is_gt_forced),
 				)
 			)
 	return rows

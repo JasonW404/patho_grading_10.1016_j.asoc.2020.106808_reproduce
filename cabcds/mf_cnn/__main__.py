@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 from pathlib import Path
 import random
+import re
 import signal
+from zipfile import ZipFile
 
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,17 +48,416 @@ logger = logging.getLogger(__name__)
 
 
 def _append_metrics_row(csv_path: Path, row: dict[str, object]) -> None:
-    """Append one metrics row to a CSV file, creating headers if needed."""
+    """Append one metrics row to a CSV file.
+
+    Keeps a stable header across calls. If new keys appear in later rows, the
+    file is rewritten with an expanded header (metrics CSVs are small).
+    """
 
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(row.keys())
-    write_header = (not csv_path.exists()) or csv_path.stat().st_size == 0
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
+
+    if (not csv_path.exists()) or csv_path.stat().st_size == 0:
+        fieldnames = list(row.keys())
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
+            writer.writerow(row)
+        return
+
+    # Read existing header.
+    with csv_path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        existing_header = next(reader, None)
+    existing_header = [str(h) for h in (existing_header or [])]
+
+    if not existing_header:
+        fieldnames = list(row.keys())
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+        return
+
+    new_keys = [k for k in row.keys() if k not in existing_header]
+    if new_keys:
+        with csv_path.open("r", newline="") as f:
+            dict_reader = csv.DictReader(f)
+            old_rows = list(dict_reader)
+        fieldnames = existing_header + new_keys
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for old in old_rows:
+                writer.writerow(old)
+            writer.writerow(row)
+        return
+
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=existing_header)
         writer.writerow(row)
+
+
+def _best_f1_threshold(*, y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
+    """Compute the score threshold that maximizes F1.
+
+    Returns zeros when the curve cannot be computed (e.g. only one class).
+    """
+
+    y_true = np.asarray(y_true).astype(np.int64).reshape(-1)
+    y_score = np.asarray(y_score).astype(np.float64).reshape(-1)
+    if y_true.size == 0 or y_score.size == 0:
+        return {"best_thr": 0.5, "best_f1": 0.0, "best_precision": 0.0, "best_recall": 0.0}
+    if len(np.unique(y_true)) < 2:
+        return {"best_thr": 0.5, "best_f1": 0.0, "best_precision": 0.0, "best_recall": 0.0}
+
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    if thresholds.size == 0:
+        return {"best_thr": 0.5, "best_f1": 0.0, "best_precision": 0.0, "best_recall": 0.0}
+
+    precision_t = precision[:-1]
+    recall_t = recall[:-1]
+    f1 = (2.0 * precision_t * recall_t) / np.maximum(1e-12, precision_t + recall_t)
+    best_idx = int(np.nanargmax(f1))
+    return {
+        "best_thr": float(thresholds[best_idx]),
+        "best_f1": float(f1[best_idx]),
+        "best_precision": float(precision_t[best_idx]),
+        "best_recall": float(recall_t[best_idx]),
+    }
+
+
+def _qa_det_index(
+    *,
+    index_csv: Path,
+    out_dir: Path,
+    radius: int,
+    samples: int,
+    seed: int,
+) -> None:
+    """QA a prepared CNN_det `index.csv` against GT centroids.
+
+    Produces:
+      - `qa_distances.csv`: per-patch nearest-GT distance.
+      - `qa_summary.json`: aggregate stats (pos/neg counts, within-radius rates).
+      - `qa_samples.png`: optional grid of patch thumbnails with overlayed center.
+    """
+
+    index_csv = Path(index_csv)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = load_mfc_cnn_config()
+    base = cfg.tupac_aux_mitoses_dir
+    ground_truth_zip = base / cfg.mitoses_ground_truth_zip
+    det_crop_size = int(getattr(cfg, "det_crop_size", 80))
+
+    if not index_csv.exists():
+        raise FileNotFoundError(f"index_csv not found: {index_csv}")
+    if not ground_truth_zip.exists():
+        raise FileNotFoundError(f"ground_truth_zip not found: {ground_truth_zip}")
+
+    centroid_cache: dict[tuple[str, str], list[tuple[int, int]]] = {}
+
+    def _read_centroids(case_id: str, tile_id: str) -> list[tuple[int, int]]:
+        key = (str(case_id), str(tile_id))
+        if key in centroid_cache:
+            return centroid_cache[key]
+        member = f"mitoses_ground_truth/{case_id}/{tile_id}.csv"
+        try:
+            with ZipFile(ground_truth_zip) as zf:
+                with zf.open(member) as fp:
+                    content = fp.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            centroid_cache[key] = []
+            return []
+
+        out: list[tuple[int, int]] = []
+        if content:
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    x = int(float(parts[0]))
+                    y = int(float(parts[1]))
+                except Exception:
+                    continue
+                out.append((x, y))
+        centroid_cache[key] = out
+        return out
+
+    rows: list[dict[str, object]] = []
+    with index_csv.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    if not rows:
+        logger.warning("QA det index: empty index_csv=%s", str(index_csv))
+        return
+
+    # Compute nearest centroid distance for each patch.
+    out_rows: list[dict[str, object]] = []
+    pos_d: list[float] = []
+    neg_d: list[float] = []
+    within_pos = 0
+    within_neg = 0
+    r2 = float(int(radius) * int(radius))
+
+    # Also compute GT coverage: for each GT centroid, what is the nearest candidate center?
+    # (a) any candidate, (b) positive-labeled candidate.
+    tile_to_candidates: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    tile_to_pos_candidates: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    tile_to_windows: dict[tuple[str, str], list[tuple[int, int, int, int]]] = {}
+    tile_to_pos_windows: dict[tuple[str, str], list[tuple[int, int, int, int]]] = {}
+
+    for r in rows:
+        case_id = str(r.get("case_id") or "")
+        tile_id = str(r.get("tile_id") or "")
+        label = int(float(r.get("label") or 0))
+        cx = int(float(r.get("cx") or 0))
+        cy = int(float(r.get("cy") or 0))
+        top = int(float(r.get("top") or 0))
+        left = int(float(r.get("left") or 0))
+        mean_prob = float(r.get("mean_prob") or 0.0)
+        max_prob = float(r.get("max_prob") or 0.0)
+        area = int(float(r.get("area") or 0))
+
+        cents = _read_centroids(case_id, tile_id)
+        if not cents:
+            d2 = float("inf")
+        else:
+            d2 = float(min((cx - gx) ** 2 + (cy - gy) ** 2 for gx, gy in cents))
+        d = float(np.sqrt(d2)) if np.isfinite(d2) else float("inf")
+
+        if label == 1:
+            pos_d.append(d)
+            if d2 <= r2:
+                within_pos += 1
+        else:
+            neg_d.append(d)
+            if d2 <= r2:
+                within_neg += 1
+
+        out_rows.append(
+            {
+                "path": str(r.get("path") or ""),
+                "label": int(label),
+                "case_id": case_id,
+                "tile_id": tile_id,
+                "cx": int(cx),
+                "cy": int(cy),
+                "top": int(top),
+                "left": int(left),
+                "area": int(area),
+                "mean_prob": float(mean_prob),
+                "max_prob": float(max_prob),
+                "nearest_gt_dist": float(d),
+                "nearest_gt_within_r": bool(d2 <= r2),
+            }
+        )
+
+        key = (case_id, tile_id)
+        tile_to_candidates.setdefault(key, []).append((int(cx), int(cy)))
+        tile_to_windows.setdefault(key, []).append((int(left), int(top), int(left) + det_crop_size, int(top) + det_crop_size))
+        if int(label) == 1:
+            tile_to_pos_candidates.setdefault(key, []).append((int(cx), int(cy)))
+            tile_to_pos_windows.setdefault(key, []).append((int(left), int(top), int(left) + det_crop_size, int(top) + det_crop_size))
+
+
+    # GT coverage stats.
+    gt_total = 0
+    gt_within_any = 0
+    gt_within_pos = 0
+    gt_within_any_crop = 0
+    gt_within_pos_crop = 0
+    gt_any_d: list[float] = []
+    gt_pos_d: list[float] = []
+
+    gt_rows: list[dict[str, object]] = []
+    for (case_id, tile_id), cands in tile_to_candidates.items():
+        cents = _read_centroids(case_id, tile_id)
+        if not cents:
+            continue
+        pos_cands = tile_to_pos_candidates.get((case_id, tile_id), [])
+        windows = tile_to_windows.get((case_id, tile_id), [])
+        pos_windows = tile_to_pos_windows.get((case_id, tile_id), [])
+
+        for gx, gy in cents:
+            gt_total += 1
+            if cands:
+                any_d2 = float(min((gx - cx) ** 2 + (gy - cy) ** 2 for cx, cy in cands))
+            else:
+                any_d2 = float("inf")
+            any_cand_d = float(np.sqrt(any_d2)) if np.isfinite(any_d2) else float("inf")
+            gt_any_d.append(any_cand_d)
+            within_any = bool(any_d2 <= r2)
+            if within_any:
+                gt_within_any += 1
+
+            if pos_cands:
+                pos_d2 = float(min((gx - cx) ** 2 + (gy - cy) ** 2 for cx, cy in pos_cands))
+            else:
+                pos_d2 = float("inf")
+            pos_cand_d = float(np.sqrt(pos_d2)) if np.isfinite(pos_d2) else float("inf")
+            gt_pos_d.append(pos_cand_d)
+            within_pos_cand = bool(pos_d2 <= r2)
+            if within_pos_cand:
+                gt_within_pos += 1
+
+            within_any_crop = bool(any(l <= gx < r and t <= gy < b for l, t, r, b in windows))
+            within_pos_crop = bool(any(l <= gx < r and t <= gy < b for l, t, r, b in pos_windows))
+            if within_any_crop:
+                gt_within_any_crop += 1
+            if within_pos_crop:
+                gt_within_pos_crop += 1
+
+            gt_rows.append(
+                {
+                    "case_id": str(case_id),
+                    "tile_id": str(tile_id),
+                    "gt_x": int(gx),
+                    "gt_y": int(gy),
+                    "nearest_any_cand_dist": float(any_cand_d),
+                    "nearest_any_cand_within_r": bool(within_any),
+                    "nearest_pos_cand_dist": float(pos_cand_d),
+                    "nearest_pos_cand_within_r": bool(within_pos_cand),
+                    "within_any_crop": bool(within_any_crop),
+                    "within_pos_crop": bool(within_pos_crop),
+                    "n_tile_candidates": int(len(cands)),
+                    "n_tile_pos_candidates": int(len(pos_cands)),
+                }
+            )
+
+    def _pct(p: int, n: int) -> float:
+        return float(p / max(1, n))
+
+    def _finite(values: list[float]) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        return arr[np.isfinite(arr)]
+
+    pos_d_f = _finite(pos_d)
+    neg_d_f = _finite(neg_d)
+    gt_any_d_f = _finite(gt_any_d)
+    gt_pos_d_f = _finite(gt_pos_d)
+
+    summary = {
+        "index_csv": str(index_csv),
+        "ground_truth_zip": str(ground_truth_zip),
+        "radius": int(radius),
+        "n_rows": int(len(out_rows)),
+        "n_pos": int(len(pos_d)),
+        "n_neg": int(len(neg_d)),
+        "gt_total": int(gt_total),
+        "gt_within_r_any_candidate": int(gt_within_any),
+        "gt_within_r_positive_candidate": int(gt_within_pos),
+        "gt_within_r_any_candidate_rate": _pct(gt_within_any, gt_total),
+        "gt_within_r_positive_candidate_rate": _pct(gt_within_pos, gt_total),
+        "gt_within_any_crop": int(gt_within_any_crop),
+        "gt_within_pos_crop": int(gt_within_pos_crop),
+        "gt_within_any_crop_rate": _pct(gt_within_any_crop, gt_total),
+        "gt_within_pos_crop_rate": _pct(gt_within_pos_crop, gt_total),
+        "pos_within_r": int(within_pos),
+        "neg_within_r": int(within_neg),
+        "pos_within_r_rate": _pct(within_pos, len(pos_d)),
+        "neg_within_r_rate": _pct(within_neg, len(neg_d)),
+        "pos_dist_median": float(np.median(pos_d_f)) if pos_d_f.size else float("nan"),
+        "neg_dist_median": float(np.median(neg_d_f)) if neg_d_f.size else float("nan"),
+        "pos_dist_p90": float(np.percentile(pos_d_f, 90)) if pos_d_f.size else float("nan"),
+        "neg_dist_p10": float(np.percentile(neg_d_f, 10)) if neg_d_f.size else float("nan"),
+        "gt_any_cand_dist_median": float(np.median(gt_any_d_f)) if gt_any_d_f.size else float("nan"),
+        "gt_any_cand_dist_p90": float(np.percentile(gt_any_d_f, 90)) if gt_any_d_f.size else float("nan"),
+        "gt_pos_cand_dist_median": float(np.median(gt_pos_d_f)) if gt_pos_d_f.size else float("nan"),
+        "gt_pos_cand_dist_p90": float(np.percentile(gt_pos_d_f, 90)) if gt_pos_d_f.size else float("nan"),
+    }
+
+    (out_dir / "qa_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    with (out_dir / "qa_distances.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(out_rows)
+
+    if gt_rows:
+        with (out_dir / "qa_gt_coverage.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(gt_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(gt_rows)
+
+    logger.info(
+        "QA det index done: rows=%d pos=%d neg=%d pos_within_r=%.3f neg_within_r=%.3f out=%s",
+        int(summary["n_rows"]),
+        int(summary["n_pos"]),
+        int(summary["n_neg"]),
+        float(summary["pos_within_r_rate"]),
+        float(summary["neg_within_r_rate"]),
+        str(out_dir),
+    )
+
+    # Optional sample grid.
+    if int(samples) <= 0:
+        return
+
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return
+
+    rng = random.Random(int(seed))
+    pos_rows = [r for r in out_rows if int(r["label"]) == 1]
+    neg_rows = [r for r in out_rows if int(r["label"]) == 0]
+    rng.shuffle(pos_rows)
+    rng.shuffle(neg_rows)
+
+    half = int(samples) // 2
+    chosen = pos_rows[:half] + neg_rows[: max(0, int(samples) - half)]
+    if not chosen:
+        return
+
+    thumb = 96
+    cols = int(np.ceil(np.sqrt(len(chosen))))
+    rows_n = int(np.ceil(len(chosen) / max(1, cols)))
+    canvas = Image.new("RGB", (cols * thumb, rows_n * thumb), (0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    for i, r in enumerate(chosen):
+        path = Path(str(r["path"]))
+        try:
+            im = Image.open(path).convert("RGB")
+        except Exception:
+            continue
+
+        # Estimate candidate center in patch coordinates.
+        # With the new index fields, center is (cx-left, cy-top). Otherwise, default to patch center.
+        cx = int(r.get("cx") or 0)
+        cy = int(r.get("cy") or 0)
+        left = int(r.get("left") or 0)
+        top = int(r.get("top") or 0)
+        px = cx - left
+        py = cy - top
+        if px <= 0 and py <= 0:
+            px = im.size[0] // 2
+            py = im.size[1] // 2
+
+        # Overlay center cross.
+        d = ImageDraw.Draw(im)
+        d.line([(px - 4, py), (px + 4, py)], fill=(255, 0, 0), width=1)
+        d.line([(px, py - 4), (px, py + 4)], fill=(255, 0, 0), width=1)
+
+        im_t = im.resize((thumb, thumb))
+        x0 = (i % cols) * thumb
+        y0 = (i // cols) * thumb
+        canvas.paste(im_t, (x0, y0))
+
+        # Small label marker.
+        lab = int(r["label"])
+        color = (0, 255, 0) if lab == 1 else (255, 255, 0)
+        draw.rectangle([x0, y0, x0 + 8, y0 + 8], fill=color)
+
+    canvas.save(out_dir / "qa_samples.png")
 
 
 @torch.no_grad()
@@ -200,6 +602,9 @@ def _train_seg_paper(
     final_epochs: int,
     max_steps_per_epoch: int,
     device: str,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
     split_seed: int,
     eval_max_batches: int,
     eval_every: int,
@@ -228,7 +633,6 @@ def _train_seg_paper(
     if not bool(cfg.use_external_mitosis_datasets):
         logger.warning(
             "Paper-aligned CNN_seg typically requires external MITOS12+MITOS14. "
-            "Running without external datasets enabled (CABCDS_MFCNN_USE_EXTERNAL_MITOSIS_DATASETS=0). "
             "To use them, set this env var to 1."
         )
 
@@ -856,6 +1260,7 @@ def _eval_det_loader(
     loader: DataLoader,
     device: torch.device,
     max_batches: int = 0,
+    threshold: float | None = None,
 ) -> dict[str, float]:
     criterion = nn.CrossEntropyLoss()
     model.eval()
@@ -903,14 +1308,50 @@ def _eval_det_loader(
     precision = float(tp / max(1, tp + fp))
     recall = float(tp / max(1, tp + fn))
     f1 = float((2 * precision * recall) / max(1e-12, precision + recall))
-    
+
     auc = 0.0
+    ap = 0.0
+    best_f1 = 0.0
+    best_thr = 0.5
+    best_precision = 0.0
+    best_recall = 0.0
+    best_tp = best_fp = best_fn = best_tn = 0.0
+
+    thr_used = float(threshold) if threshold is not None else float("nan")
+    thr_precision = 0.0
+    thr_recall = 0.0
+    thr_f1 = 0.0
+    thr_tp = thr_fp = thr_fn = thr_tn = 0.0
+
     if all_y_true:
         try:
             y_true_flat = np.concatenate(all_y_true)
             y_score_flat = np.concatenate(all_y_score)
             if len(np.unique(y_true_flat)) > 1:
                 auc = float(roc_auc_score(y_true_flat, y_score_flat))
+                ap = float(average_precision_score(y_true_flat, y_score_flat))
+
+                best = _best_f1_threshold(y_true=y_true_flat, y_score=y_score_flat)
+                best_f1 = float(best["best_f1"])
+                best_thr = float(best["best_thr"])
+                best_precision = float(best["best_precision"])
+                best_recall = float(best["best_recall"])
+
+                preds_best = (y_score_flat >= best_thr).astype(np.int64)
+                best_tp = float(np.sum((preds_best == 1) & (y_true_flat == 1)))
+                best_fp = float(np.sum((preds_best == 1) & (y_true_flat == 0)))
+                best_fn = float(np.sum((preds_best == 0) & (y_true_flat == 1)))
+                best_tn = float(np.sum((preds_best == 0) & (y_true_flat == 0)))
+
+                if threshold is not None:
+                    preds_thr = (y_score_flat >= float(threshold)).astype(np.int64)
+                    thr_tp = float(np.sum((preds_thr == 1) & (y_true_flat == 1)))
+                    thr_fp = float(np.sum((preds_thr == 1) & (y_true_flat == 0)))
+                    thr_fn = float(np.sum((preds_thr == 0) & (y_true_flat == 1)))
+                    thr_tn = float(np.sum((preds_thr == 0) & (y_true_flat == 0)))
+                    thr_precision = float(thr_tp / max(1e-12, thr_tp + thr_fp))
+                    thr_recall = float(thr_tp / max(1e-12, thr_tp + thr_fn))
+                    thr_f1 = float((2 * thr_precision * thr_recall) / max(1e-12, thr_precision + thr_recall))
         except Exception:
             pass
 
@@ -919,9 +1360,26 @@ def _eval_det_loader(
         "loss": avg_loss,
         "acc": acc,
         "auc": auc,
+        "ap": ap,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "best_f1": float(best_f1),
+        "best_thr": float(best_thr),
+        "best_precision": float(best_precision),
+        "best_recall": float(best_recall),
+        "best_tp": float(best_tp),
+        "best_fp": float(best_fp),
+        "best_fn": float(best_fn),
+        "best_tn": float(best_tn),
+        "thr_used": float(thr_used),
+        "thr_precision": float(thr_precision),
+        "thr_recall": float(thr_recall),
+        "thr_f1": float(thr_f1),
+        "thr_tp": float(thr_tp),
+        "thr_fp": float(thr_fp),
+        "thr_fn": float(thr_fn),
+        "thr_tn": float(thr_tn),
         "tp": float(tp),
         "fp": float(fp),
         "fn": float(fn),
@@ -940,6 +1398,23 @@ def _train_det_paper(
     device: str,
     split_seed: int,
     early_stop_patience: int = 5,
+    eval_every: int = 1,
+    eval_max_batches: int = 0,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    balanced_sampler: bool = True,
+    class_weight_mode: str = "auto",
+    pos_weight: float = 0.0,
+    focal_gamma: float = 0.0,
+    select_metric: str = "ap",
+    hnm_enabled: bool = False,
+    hnm_start_epoch: int = 2,
+    hnm_every: int = 1,
+    hnm_topk: int = 2000,
+    hnm_boost: float = 3.0,
+    hnm_max_batches: int = 0,
+    resume: bool = False,
 ) -> None:
     """Paper-aligned CNN_det training: 60/20/20 case split.
 
@@ -949,13 +1424,79 @@ def _train_det_paper(
     - Final phase: Train on 80% (60+20), monitor on 20% test (early stop).
     - Model: AlexNet (pretrained), resized inputs to 227x227.
     - Hyperparameters: SGD lr=0.0001, momentum=0.9, weight_decay=0.0005.
+
+    Notes:
+        `eval_every` allows skipping val/test evaluation to speed up training.
+        Default is 1 (evaluate every epoch, paper-aligned).
     """
 
     index_csv = Path(index_csv)
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    last_checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_last.pt")
+    tune_best_checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_tune_best.pt")
+    final_best_checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_final_best.pt")
+
     metrics_csv = Path(metrics_csv)
     _append_metrics_row(metrics_csv, {"event": "start", "device": device})
+
+    cfg = load_mfc_cnn_config()
+
+    stop_requested = False
+
+    def _request_stop(signum: int, _frame: object | None) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        logger.warning(
+            "Stop requested (signal=%s); will checkpoint and exit at next safe point.",
+            int(signum),
+        )
+
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _request_stop)
+        except Exception:
+            # Best-effort; some environments disallow signal handlers.
+            pass
+
+    def _save_det_checkpoint(
+        path: Path,
+        *,
+        phase: str,
+        epoch: int,
+        best_score: float | None,
+        best_val_thr: float,
+        best_test_score: float | None,
+        no_improve: int,
+        best_state_dict: dict[str, torch.Tensor] | None,
+        include_optimizer: bool,
+        global_step: int,
+    ) -> None:
+        payload: dict[str, object] = {
+            "model": "CNNDet",
+            "paper_aligned": True,
+            "phase": str(phase),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "best_score": float(best_score) if best_score is not None else None,
+            "best_val_thr": float(best_val_thr),
+            "best_test_score": float(best_test_score) if best_test_score is not None else None,
+            "no_improve": int(no_improve),
+            "best_state_dict": (
+                {k: v.detach().cpu() for k, v in best_state_dict.items()}
+                if best_state_dict is not None
+                else None
+            ),
+            "config": cfg.model_dump(mode="json"),
+        }
+        if bool(include_optimizer):
+            payload["optimizer_state"] = optimizer.state_dict()
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+        logger.info("Saved CNN_det(paper) checkpoint: %s", str(path))
 
     # Load and split
     rows = read_det_patch_index(index_csv)
@@ -972,8 +1513,9 @@ def _train_det_paper(
     test_cases = set(case_ids[n_train+n_val:])
     
     train_rows = [r for r in rows if r.case_id in train_cases]
-    val_rows = [r for r in rows if r.case_id in val_cases]
-    test_rows = [r for r in rows if r.case_id in test_cases]
+    # Do not evaluate on GT-forced patches; keep val/test reflecting pure CNN_seg candidate proposals.
+    val_rows = [r for r in rows if r.case_id in val_cases and int(getattr(r, "is_gt_forced", 0)) == 0]
+    test_rows = [r for r in rows if r.case_id in test_cases and int(getattr(r, "is_gt_forced", 0)) == 0]
     
     logger.info(
         "CNN_det split (cases): total=%d train=%d val=%d test=%d seed=%d",
@@ -984,18 +1526,70 @@ def _train_det_paper(
         len(rows), len(train_rows), len(val_rows), len(test_rows)
     )
 
-    cfg = load_mfc_cnn_config()
-    
     # Datasets with normalization=False because we normalize in loop
     train_ds = PreparedMitosisDetectionPatchDataset(rows=train_rows, output_size=227, normalize_imagenet=False)
     val_ds = PreparedMitosisDetectionPatchDataset(rows=val_rows, output_size=227, normalize_imagenet=False)
     test_ds = PreparedMitosisDetectionPatchDataset(rows=test_rows, output_size=227, normalize_imagenet=False)
-    
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=int(batch_size), shuffle=False, num_workers=0)
+
+    num_workers_i = max(0, int(num_workers))
+    loader_kwargs: dict[str, object] = {
+        "num_workers": int(num_workers_i),
+    }
+    if int(num_workers_i) > 0:
+        # Reduce process spawn overhead across epochs.
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
     device_t = _resolve_torch_device(device)
+
+    # Imbalance handling: optional balanced sampling + optional loss weighting.
+    train_labels = [int(r.label) for r in train_rows]
+    n_pos = int(sum(1 for y in train_labels if y == 1))
+    n_neg = int(len(train_labels) - n_pos)
+    logger.info(
+        "CNN_det class balance (train split): pos=%d neg=%d pos_rate=%.4f",
+        int(n_pos),
+        int(n_neg),
+        float(n_pos / max(1, len(train_labels))),
+    )
+
+    select_metric_i = str(select_metric).lower().strip()
+    if select_metric_i not in {"ap", "auc", "best_f1", "acc"}:
+        raise ValueError("--det-paper-select-metric must be one of: ap, auc, best_f1, acc")
+
+    use_sampler = bool(balanced_sampler) or bool(hnm_enabled)
+    if use_sampler:
+        # Base weights: class balancing (optional) + room for HNM boosting.
+        if bool(balanced_sampler) and n_pos > 0 and n_neg > 0:
+            w_pos = (len(train_labels) / max(1, n_pos))
+            w_neg = (len(train_labels) / max(1, n_neg))
+        else:
+            w_pos = 1.0
+            w_neg = 1.0
+
+        base_weights = torch.tensor([w_pos if y == 1 else w_neg for y in train_labels], dtype=torch.double)
+        weights_train = base_weights.clone()
+
+        def _make_train_loader(*, weights: torch.Tensor) -> DataLoader:
+            sampler_local = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            return DataLoader(train_ds, batch_size=int(batch_size), sampler=sampler_local, shuffle=False, **loader_kwargs)
+
+        train_loader = _make_train_loader(weights=weights_train)
+        logger.info(
+            "CNN_det using sampler (balanced=%s hnm=%s w_pos=%.3f w_neg=%.3f)",
+            str(bool(balanced_sampler)),
+            str(bool(hnm_enabled)),
+            float(w_pos),
+            float(w_neg),
+        )
+    else:
+        base_weights = torch.tensor([], dtype=torch.double)
+        weights_train = torch.tensor([], dtype=torch.double)
+        _make_train_loader = None  # type: ignore[assignment]
+        train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True, **loader_kwargs)
+
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=int(batch_size), shuffle=False, **loader_kwargs)
     model = CNNDet(num_classes=2, pretrained=True).to(device_t)
 
     # Paper hypers: LR=0.0001, Momentum=0.9, WD=0.0005
@@ -1005,11 +1599,90 @@ def _train_det_paper(
         momentum=0.9,
         weight_decay=0.0005,
     )
-    criterion = nn.CrossEntropyLoss()
+
+    class_weight_mode_i = str(class_weight_mode).lower().strip()
+    if class_weight_mode_i not in {"none", "auto", "manual"}:
+        raise ValueError("--det-paper-class-weight-mode must be one of: none, auto, manual")
+
+    class_weights_t: torch.Tensor | None = None
+    if class_weight_mode_i == "manual":
+        if float(pos_weight) <= 0:
+            raise ValueError("--det-paper-pos-weight must be > 0 when --det-paper-class-weight-mode=manual")
+        class_weights_t = torch.tensor([1.0, float(pos_weight)], dtype=torch.float32, device=device_t)
+        logger.info("CNN_det using manual class weights: w0=1.0 w1=%.3f", float(pos_weight))
+    elif class_weight_mode_i == "auto":
+        if n_pos > 0 and n_neg > 0:
+            w1 = float(n_neg / max(1, n_pos))
+            class_weights_t = torch.tensor([1.0, w1], dtype=torch.float32, device=device_t)
+            logger.info("CNN_det using auto class weights: w0=1.0 w1=%.3f (neg/pos)", float(w1))
+        else:
+            logger.warning("CNN_det auto class weights disabled (pos=%d neg=%d)", int(n_pos), int(n_neg))
+
+    focal_gamma_i = float(focal_gamma)
+    if focal_gamma_i < 0:
+        raise ValueError("--det-paper-focal-gamma must be >= 0")
+    if focal_gamma_i > 0:
+        logger.info("CNN_det using focal loss (gamma=%.3f)", float(focal_gamma_i))
+
+    def _criterion(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if focal_gamma_i <= 0:
+            return F.cross_entropy(logits, labels, weight=class_weights_t)
+        ce = F.cross_entropy(logits, labels, weight=class_weights_t, reduction="none")
+        pt = F.softmax(logits, dim=1).gather(1, labels.view(-1, 1)).squeeze(1)
+        loss = ((1.0 - pt).clamp(min=0.0, max=1.0) ** focal_gamma_i) * ce
+        return loss.mean()
 
     best_score: float | None = None
     best_state: dict[str, torch.Tensor] | None = None
+    best_val_thr = 0.5
     global_step = 0
+
+    resume_phase: str | None = None
+    resume_epoch_done: int = 0
+    best_test_score: float | None = None
+    no_improve = 0
+
+    if bool(resume):
+        resume_path: Path | None = None
+        for p in (last_checkpoint_path, checkpoint_path):
+            try:
+                if Path(p).exists():
+                    resume_path = Path(p)
+                    break
+            except Exception:
+                continue
+        if resume_path is not None:
+            logger.info("Resuming CNN_det(paper) from checkpoint: %s", str(resume_path))
+            payload = torch.load(resume_path, map_location="cpu")
+            state_dict = payload.get("state_dict")
+            if isinstance(state_dict, dict):
+                model.load_state_dict(state_dict)
+            opt_state = payload.get("optimizer_state")
+            if isinstance(opt_state, dict):
+                try:
+                    optimizer.load_state_dict(opt_state)
+                except Exception as e:
+                    logger.warning("Failed to restore optimizer state (continuing): %s", str(e))
+
+            resume_phase = str(payload.get("phase") or "tune")
+            resume_epoch_done = int(payload.get("epoch") or 0)
+            global_step = int(payload.get("global_step") or 0)
+            best_score_raw = payload.get("best_score")
+            best_score = float(best_score_raw) if best_score_raw is not None else None
+            best_val_thr = float(payload.get("best_val_thr") or 0.5)
+            best_test_raw = payload.get("best_test_score")
+            best_test_score = float(best_test_raw) if best_test_raw is not None else None
+            no_improve = int(payload.get("no_improve") or 0)
+
+            best_state_raw = payload.get("best_state_dict")
+            if isinstance(best_state_raw, dict):
+                try:
+                    best_state = {str(k): v for k, v in best_state_raw.items() if isinstance(v, torch.Tensor)}
+                except Exception:
+                    best_state = None
+
+    current_phase = "tune"
+    current_epoch = 0
 
     def _run_one_epoch(*, loader: DataLoader) -> dict[str, float]:
         nonlocal global_step
@@ -1020,13 +1693,15 @@ def _train_det_paper(
         tp = fp = fn = tn = 0
 
         for images, labels in loader:
+            if bool(stop_requested):
+                break
             images = images.to(device_t)
             labels = labels.to(device_t)
             images = _imagenet_normalize_batch(images)
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(images)
-            loss = criterion(logits, labels)
+            loss = _criterion(logits, labels)
             loss.backward()
             optimizer.step()
 
@@ -1053,75 +1728,442 @@ def _train_det_paper(
         dice = float((2 * tp) / max(1, 2 * tp + fp + fn))
         return {"loss": avg, "acc": acc, "dice": dice}
 
-    logger.info("Starting Tuning Phase (Train on 60%, Val on 20%)")
-    for epoch in range(int(tune_epochs)):
-        model.train()
-        train_m = _run_one_epoch(loader=train_loader)
-        val_m = _eval_det_loader(model=model, loader=val_loader, device=device_t)
-        
-        score = val_m["acc"]
-        logger.info(
-            "CNN_det tune epoch=%d train_loss=%.4f train_acc=%.3f val_loss=%.4f val_acc=%.3f val_f1=%.3f val_auc=%.3f",
-            epoch + 1, train_m["loss"], train_m["acc"], val_m["loss"], val_m["acc"], val_m["f1"], val_m["auc"]
-        )
-        
-        _append_metrics_row(metrics_csv, {
-            "phase": "tune",
-            "epoch": epoch+1,
-            "train_loss": train_m["loss"],
-            "val_loss": val_m["loss"],
-            "val_acc": val_m["acc"],
-            "val_auc": val_m["auc"]
-        })
+    def _metric_score(metrics: dict[str, float]) -> float:
+        if select_metric_i == "best_f1":
+            return float(metrics.get("best_f1", 0.0))
+        return float(metrics.get(select_metric_i, 0.0))
 
-        if best_score is None or score > best_score:
-            best_score = score
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    def _update_hnm_weights(*, ds: PreparedMitosisDetectionPatchDataset, labels_list: list[int], base_w: torch.Tensor) -> torch.Tensor:
+        if not bool(hnm_enabled):
+            return base_w
+        if int(hnm_topk) <= 0 or float(hnm_boost) <= 1.0:
+            return base_w
+
+        score_loader = DataLoader(ds, batch_size=int(batch_size), shuffle=False, **loader_kwargs)
+        hard: list[tuple[float, int]] = []
+        seen_batches = 0
+        seen = 0
+        model.eval()
+        with torch.no_grad():
+            for images, labels in score_loader:
+                if int(hnm_max_batches) > 0 and int(seen_batches) >= int(hnm_max_batches):
+                    break
+                seen_batches += 1
+
+                images = images.to(device_t)
+                labels_t = labels.to(device_t)
+                images = _imagenet_normalize_batch(images)
+                logits = model(images)
+                probs = F.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+                labels_np = labels_t.detach().cpu().numpy().astype(np.int64)
+
+                for i in range(int(labels_np.size)):
+                    if int(labels_np[i]) == 0:
+                        hard.append((float(probs[i]), int(seen + i)))
+                seen += int(labels_np.size)
+
+        model.train()
+        if not hard:
+            return base_w
+
+        hard.sort(key=lambda t: float(t[0]), reverse=True)
+        topk = min(int(hnm_topk), len(hard))
+        hard_idx = [int(idx) for _, idx in hard[:topk] if 0 <= int(idx) < len(labels_list) and int(labels_list[int(idx)]) == 0]
+        if not hard_idx:
+            return base_w
+
+        out_w = base_w.clone()
+        out_w[torch.tensor(hard_idx, dtype=torch.long)] *= float(hnm_boost)
+        logger.info("CNN_det HNM updated: boosted %d hard negatives (topk=%d boost=%.2f)", len(hard_idx), int(topk), float(hnm_boost))
+        return out_w
+
+    eval_every_i = max(1, int(eval_every))
+    logger.info(
+        "Starting Tuning Phase (Train on 60%%, Val on 20%%); eval_every=%d eval_max_batches=%d num_workers=%d",
+        int(eval_every_i),
+        int(eval_max_batches),
+        int(num_workers_i),
+    )
+    tune_start = 0
+    if str(resume_phase or "").lower().strip() == "tune" and int(resume_epoch_done) > 0:
+        tune_start = min(int(resume_epoch_done), int(tune_epochs))
+        logger.info("Resuming tuning phase from epoch %d", int(tune_start) + 1)
+
+    try:
+        for epoch in range(int(tune_start), int(tune_epochs)):
+            if bool(stop_requested):
+                break
+
+            current_phase = "tune"
+            current_epoch = int(epoch + 1)
+
+            model.train()
+            train_m = _run_one_epoch(loader=train_loader)
+
+            if bool(stop_requested):
+                _save_det_checkpoint(
+                    last_checkpoint_path,
+                    phase="tune",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=True,
+                    global_step=int(global_step),
+                )
+                break
+
+            if (epoch + 1) % int(eval_every_i) != 0:
+                logger.info(
+                    "CNN_det tune epoch=%d train_loss=%.4f train_acc=%.3f (val skipped; eval_every=%d)",
+                    epoch + 1,
+                    train_m["loss"],
+                    train_m["acc"],
+                    int(eval_every_i),
+                )
+                _append_metrics_row(
+                    metrics_csv,
+                    {
+                        "phase": "tune",
+                        "epoch": epoch + 1,
+                        "train_loss": train_m["loss"],
+                        "val_loss": float("nan"),
+                        "val_acc": float("nan"),
+                        "val_auc": float("nan"),
+                        "val_ap": float("nan"),
+                        "val_best_f1": float("nan"),
+                        "val_best_thr": float("nan"),
+                        "val_skipped": True,
+                    },
+                )
+                _save_det_checkpoint(
+                    last_checkpoint_path,
+                    phase="tune",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=True,
+                    global_step=int(global_step),
+                )
+                continue
+
+            val_m = _eval_det_loader(
+                model=model,
+                loader=val_loader,
+                device=device_t,
+                max_batches=int(eval_max_batches),
+            )
+
+            score = _metric_score(val_m)
+            logger.info(
+                "CNN_det tune epoch=%d train_loss=%.4f train_acc=%.3f val_loss=%.4f val_acc=%.3f val_f1=%.3f val_auc=%.3f val_ap=%.3f val_best_f1=%.3f thr=%.3f",
+                epoch + 1,
+                train_m["loss"],
+                train_m["acc"],
+                val_m["loss"],
+                val_m["acc"],
+                val_m["f1"],
+                val_m["auc"],
+                val_m.get("ap", 0.0),
+                val_m.get("best_f1", 0.0),
+                val_m.get("best_thr", 0.5),
+            )
+
+            _append_metrics_row(
+                metrics_csv,
+                {
+                    "phase": "tune",
+                    "epoch": epoch + 1,
+                    "train_loss": train_m["loss"],
+                    "val_loss": val_m["loss"],
+                    "val_acc": val_m["acc"],
+                    "val_auc": val_m["auc"],
+                    "val_ap": val_m.get("ap", 0.0),
+                    "val_best_f1": val_m.get("best_f1", 0.0),
+                    "val_best_thr": val_m.get("best_thr", 0.5),
+                    "val_skipped": False,
+                },
+            )
+
+            if best_score is None or float(score) > float(best_score):
+                best_score = score
+                best_val_thr = float(val_m.get("best_thr", 0.5))
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+                _save_det_checkpoint(
+                    tune_best_checkpoint_path,
+                    phase="tune",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=False,
+                    global_step=int(global_step),
+                )
+
+            if (
+                bool(hnm_enabled)
+                and int(epoch + 1) >= int(hnm_start_epoch)
+                and (int(epoch + 1) % max(1, int(hnm_every)) == 0)
+            ):
+                if use_sampler and _make_train_loader is not None:
+                    weights_train = _update_hnm_weights(ds=train_ds, labels_list=train_labels, base_w=base_weights)
+                    train_loader = _make_train_loader(weights=weights_train)
+
+            _save_det_checkpoint(
+                last_checkpoint_path,
+                phase="tune",
+                epoch=int(epoch + 1),
+                best_score=best_score,
+                best_val_thr=float(best_val_thr),
+                best_test_score=best_test_score,
+                no_improve=int(no_improve),
+                best_state_dict=best_state,
+                include_optimizer=True,
+                global_step=int(global_step),
+            )
+    except KeyboardInterrupt:
+        stop_requested = True
+        logger.warning("KeyboardInterrupt received; saving last checkpoint and exiting.")
+        _save_det_checkpoint(
+            last_checkpoint_path,
+            phase=str(current_phase),
+            epoch=int(current_epoch),
+            best_score=best_score,
+            best_val_thr=float(best_val_thr),
+            best_test_score=best_test_score,
+            no_improve=int(no_improve),
+            best_state_dict=best_state,
+            include_optimizer=True,
+            global_step=int(global_step),
+        )
+        return
     
     if best_state is not None:
         model.load_state_dict(best_state)
-        logger.info("Restored best model from tuning phase (acc=%.3f)", best_score)
+        logger.info("Restored best model from tuning phase (%s=%.4f best_val_thr=%.3f)", select_metric_i, float(best_score or 0.0), float(best_val_thr))
     
+    if bool(stop_requested):
+        logger.info("Stop requested; skipping final phase.")
+        return
+
     logger.info("Starting Final Phase (Train on 80%, Monitor on 20% Test)")
     
     final_rows = train_rows + val_rows
     final_ds = PreparedMitosisDetectionPatchDataset(rows=final_rows, output_size=227, normalize_imagenet=False)
-    final_loader = DataLoader(final_ds, batch_size=int(batch_size), shuffle=True, num_workers=0)
-    
-    no_improve = 0
-    best_test_score = 0.0
-    
-    for epoch in range(int(final_epochs)):
-        model.train()
-        train_m = _run_one_epoch(loader=final_loader)
-        test_m = _eval_det_loader(model=model, loader=test_loader, device=device_t)
-        
-        score = test_m["acc"]
-        
-        logger.info(
-            "CNN_det final epoch=%d train_loss=%.4f train_acc=%.3f test_loss=%.4f test_acc=%.3f test_f1=%.3f test_auc=%.3f",
-            epoch + 1, train_m["loss"], train_m["acc"], test_m["loss"], test_m["acc"], test_m["f1"], test_m["auc"]
-        )
-        
-        _append_metrics_row(metrics_csv, {
-            "phase": "final",
-            "epoch": epoch+1,
-            "train_loss": train_m["loss"],
-            "test_loss": test_m["loss"],
-            "test_acc": test_m["acc"],
-            "test_auc": test_m["auc"]
-        })
-        
-        if score > best_test_score:
-            best_test_score = score
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
+    use_sampler_f = bool(balanced_sampler) or bool(hnm_enabled)
+    if bool(use_sampler_f):
+        final_labels = [int(r.label) for r in final_rows]
+        n_pos_f = int(sum(1 for y in final_labels if y == 1))
+        n_neg_f = int(len(final_labels) - n_pos_f)
+        if bool(balanced_sampler) and n_pos_f > 0 and n_neg_f > 0:
+            w_pos_f = (len(final_labels) / max(1, n_pos_f))
+            w_neg_f = (len(final_labels) / max(1, n_neg_f))
         else:
-            no_improve += 1
-            
-        if early_stop_patience > 0 and no_improve >= early_stop_patience:
-             logger.info("Early stopping triggered at final epoch %d", epoch+1)
-             break
+            w_pos_f = 1.0
+            w_neg_f = 1.0
+        base_weights_f = torch.tensor([w_pos_f if y == 1 else w_neg_f for y in final_labels], dtype=torch.double)
+        weights_final = base_weights_f.clone()
+
+        def _make_final_loader(*, weights: torch.Tensor) -> DataLoader:
+            sampler_local = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            return DataLoader(final_ds, batch_size=int(batch_size), sampler=sampler_local, shuffle=False, **loader_kwargs)
+
+        final_loader = _make_final_loader(weights=weights_final)
+    else:
+        base_weights_f = torch.tensor([], dtype=torch.double)
+        weights_final = torch.tensor([], dtype=torch.double)
+        _make_final_loader = None  # type: ignore[assignment]
+        final_loader = DataLoader(final_ds, batch_size=int(batch_size), shuffle=True, **loader_kwargs)
+    
+    # Resume directly into final phase if requested.
+    final_start = 0
+    if str(resume_phase or "").lower().strip() == "final" and int(resume_epoch_done) > 0:
+        final_start = min(int(resume_epoch_done), int(final_epochs))
+        logger.info("Resuming final phase from epoch %d", int(final_start) + 1)
+
+    if best_test_score is None:
+        best_test_score = 0.0
+
+    try:
+        for epoch in range(int(final_start), int(final_epochs)):
+            if bool(stop_requested):
+                break
+
+            current_phase = "final"
+            current_epoch = int(epoch + 1)
+
+            model.train()
+            train_m = _run_one_epoch(loader=final_loader)
+
+            if bool(stop_requested):
+                _save_det_checkpoint(
+                    last_checkpoint_path,
+                    phase="final",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=True,
+                    global_step=int(global_step),
+                )
+                break
+
+            if (epoch + 1) % int(eval_every_i) != 0:
+                logger.info(
+                    "CNN_det final epoch=%d train_loss=%.4f train_acc=%.3f (test skipped; eval_every=%d)",
+                    epoch + 1,
+                    train_m["loss"],
+                    train_m["acc"],
+                    int(eval_every_i),
+                )
+                _append_metrics_row(
+                    metrics_csv,
+                    {
+                        "phase": "final",
+                        "epoch": epoch + 1,
+                        "train_loss": train_m["loss"],
+                        "test_loss": float("nan"),
+                        "test_acc": float("nan"),
+                        "test_auc": float("nan"),
+                        "test_ap": float("nan"),
+                        "test_best_f1": float("nan"),
+                        "test_best_thr": float("nan"),
+                        "test_thr_used": float("nan"),
+                        "test_f1_at_val_thr": float("nan"),
+                        "test_precision_at_val_thr": float("nan"),
+                        "test_recall_at_val_thr": float("nan"),
+                        "test_skipped": True,
+                    },
+                )
+                _save_det_checkpoint(
+                    last_checkpoint_path,
+                    phase="final",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=True,
+                    global_step=int(global_step),
+                )
+                continue
+
+            test_m = _eval_det_loader(
+                model=model,
+                loader=test_loader,
+                device=device_t,
+                max_batches=int(eval_max_batches),
+                threshold=float(best_val_thr),
+            )
+
+            score = _metric_score(test_m)
+
+            logger.info(
+                "CNN_det final epoch=%d train_loss=%.4f train_acc=%.3f test_loss=%.4f test_acc=%.3f test_f1=%.3f test_auc=%.3f test_ap=%.3f test_best_f1=%.3f thr=%.3f",
+                epoch + 1,
+                train_m["loss"],
+                train_m["acc"],
+                test_m["loss"],
+                test_m["acc"],
+                test_m["f1"],
+                test_m["auc"],
+                test_m.get("ap", 0.0),
+                test_m.get("best_f1", 0.0),
+                test_m.get("best_thr", 0.5),
+            )
+
+            _append_metrics_row(
+                metrics_csv,
+                {
+                    "phase": "final",
+                    "epoch": epoch + 1,
+                    "train_loss": train_m["loss"],
+                    "test_loss": test_m["loss"],
+                    "test_acc": test_m["acc"],
+                    "test_auc": test_m["auc"],
+                    "test_ap": test_m.get("ap", 0.0),
+                    "test_best_f1": test_m.get("best_f1", 0.0),
+                    "test_best_thr": test_m.get("best_thr", 0.5),
+                    "test_thr_used": test_m.get("thr_used", float("nan")),
+                    "test_f1_at_val_thr": test_m.get("thr_f1", 0.0),
+                    "test_precision_at_val_thr": test_m.get("thr_precision", 0.0),
+                    "test_recall_at_val_thr": test_m.get("thr_recall", 0.0),
+                    "test_skipped": False,
+                },
+            )
+
+            if float(score) > float(best_test_score):
+                best_test_score = score
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+
+                _save_det_checkpoint(
+                    final_best_checkpoint_path,
+                    phase="final",
+                    epoch=int(epoch + 1),
+                    best_score=best_score,
+                    best_val_thr=float(best_val_thr),
+                    best_test_score=best_test_score,
+                    no_improve=int(no_improve),
+                    best_state_dict=best_state,
+                    include_optimizer=False,
+                    global_step=int(global_step),
+                )
+            else:
+                no_improve += 1
+
+            if (
+                bool(hnm_enabled)
+                and int(epoch + 1) >= int(hnm_start_epoch)
+                and (int(epoch + 1) % max(1, int(hnm_every)) == 0)
+            ):
+                if bool(use_sampler_f) and _make_final_loader is not None:
+                    weights_final = _update_hnm_weights(ds=final_ds, labels_list=final_labels, base_w=base_weights_f)
+                    final_loader = _make_final_loader(weights=weights_final)
+
+            if early_stop_patience > 0 and no_improve >= early_stop_patience:
+                logger.info("Early stopping triggered at final epoch %d", epoch + 1)
+                break
+
+            _save_det_checkpoint(
+                last_checkpoint_path,
+                phase="final",
+                epoch=int(epoch + 1),
+                best_score=best_score,
+                best_val_thr=float(best_val_thr),
+                best_test_score=best_test_score,
+                no_improve=int(no_improve),
+                best_state_dict=best_state,
+                include_optimizer=True,
+                global_step=int(global_step),
+            )
+    except KeyboardInterrupt:
+        stop_requested = True
+        logger.warning("KeyboardInterrupt received; saving last checkpoint and exiting.")
+        _save_det_checkpoint(
+            last_checkpoint_path,
+            phase=str(current_phase),
+            epoch=int(current_epoch),
+            best_score=best_score,
+            best_val_thr=float(best_val_thr),
+            best_test_score=best_test_score,
+            no_improve=int(no_improve),
+            best_state_dict=best_state,
+            include_optimizer=True,
+            global_step=int(global_step),
+        )
+        return
              
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -1475,11 +2517,150 @@ def main() -> None:
     parser.add_argument("--det-max-tiles", type=int, default=0, help="Limit tiles when preparing det patches (0=all)")
     parser.add_argument("--det-max-candidates-per-tile", type=int, default=200)
     parser.add_argument("--det-max-neg-per-pos", type=int, default=3)
+    parser.add_argument(
+        "--det-match-radius",
+        type=int,
+        default=30,
+        help=(
+            "Radius (pixels) around GT centroid to match predicted candidate components when labeling positives. "
+            "0 enforces exact-pixel containment."
+        ),
+    )
+
+    parser.add_argument(
+        "--det-add-gt-patches",
+        action="store_true",
+        help=(
+            "Add GT-forced positive patches centered on pathologist centroids. "
+            "This increases GT coverage for CNN_det training when CNN_seg candidates miss GTs. "
+            "These rows are marked is_gt_forced=1 in index.csv."
+        ),
+    )
+    parser.add_argument(
+        "--det-gt-patches-all",
+        action="store_true",
+        help=(
+            "When used with --det-add-gt-patches, add GT patches for every centroid (default is only for GTs "
+            "that are not matched to any candidate within match radius)."
+        ),
+    )
+
+    parser.add_argument(
+        "--det-min-region-area",
+        type=int,
+        default=1,
+        help="Minimum connected-component area for CNN_seg candidates (filters tiny blobs)",
+    )
+    parser.add_argument(
+        "--det-min-region-mean-prob",
+        type=float,
+        default=0.0,
+        help="Minimum mean CNN_seg positive-class probability over a candidate region",
+    )
+    parser.add_argument(
+        "--det-min-region-max-prob",
+        type=float,
+        default=0.0,
+        help="Minimum max CNN_seg positive-class probability within a candidate region",
+    )
+
+    parser.add_argument("--qa-det-index", action="store_true", help="QA a prepared CNN_det index.csv against GT centroids")
+    parser.add_argument(
+        "--qa-det-index-csv",
+        type=str,
+        default=None,
+        help="Index CSV to QA (defaults to config.output_dir/det_patches/index.csv)",
+    )
+    parser.add_argument(
+        "--qa-det-out-dir",
+        type=str,
+        default=None,
+        help="Output folder for QA reports (defaults to <index_csv.parent>/qa)",
+    )
+    parser.add_argument("--qa-det-radius", type=int, default=30, help="Distance threshold (pixels) for within-radius stats")
+    parser.add_argument("--qa-det-samples", type=int, default=64, help="Render this many patch thumbnails into qa_samples.png (0 disables)")
+    parser.add_argument("--qa-det-seed", type=int, default=1337)
 
     parser.add_argument("--train-det-paper", action="store_true", help="Run paper-aligned CNN_det training")
+    parser.add_argument(
+        "--det-paper-resume",
+        action="store_true",
+        help="Resume paper-aligned CNN_det training from <checkpoint>_last.pt if present",
+    )
     parser.add_argument("--det-paper-tune-epochs", type=int, default=10, help="Epochs for tuning phase")
     parser.add_argument("--det-paper-final-epochs", type=int, default=5, help="Epochs for final phase")
     parser.add_argument("--det-paper-split-seed", type=int, default=1337)
+    parser.add_argument(
+        "--det-paper-eval-every",
+        type=int,
+        default=1,
+        help="Run val/test evaluation every N epochs during CNN_det paper training (default 1; set 2 to speed up)",
+    )
+    parser.add_argument(
+        "--det-paper-eval-max-batches",
+        type=int,
+        default=0,
+        help="Limit val/test evaluation to at most this many batches (0=all)",
+    )
+    parser.add_argument(
+        "--det-paper-num-workers",
+        type=int,
+        default=4,
+        help="DataLoader num_workers for CNN_det paper training (0 disables multiprocessing)",
+    )
+    parser.add_argument(
+        "--det-paper-prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch_factor when num_workers>0 (default 2)",
+    )
+    parser.add_argument(
+        "--det-paper-no-persistent-workers",
+        action="store_true",
+        help="Disable persistent DataLoader workers (may help on some systems)",
+    )
+    parser.add_argument(
+        "--det-paper-no-balanced-sampler",
+        action="store_true",
+        help="Disable class balancing via WeightedRandomSampler for CNN_det paper training",
+    )
+    parser.add_argument(
+        "--det-paper-class-weight-mode",
+        type=str,
+        default="auto",
+        choices=["none", "auto", "manual"],
+        help="Loss class weighting mode for CNN_det paper training (default auto=neg/pos)",
+    )
+    parser.add_argument(
+        "--det-paper-pos-weight",
+        type=float,
+        default=0.0,
+        help="Positive-class weight (w1) when --det-paper-class-weight-mode=manual",
+    )
+    parser.add_argument(
+        "--det-paper-focal-gamma",
+        type=float,
+        default=0.0,
+        help="Use focal loss with this gamma (0 disables; typical 1-2)",
+    )
+    parser.add_argument(
+        "--det-paper-select-metric",
+        type=str,
+        default="ap",
+        choices=["ap", "auc", "best_f1", "acc"],
+        help="Metric used to select best model / early-stop: ap|auc|best_f1|acc (default ap)",
+    )
+    parser.add_argument("--det-paper-hnm", action="store_true", help="Enable hard negative mining (sampler weight boosting)")
+    parser.add_argument("--det-paper-hnm-start-epoch", type=int, default=2, help="Start HNM at this epoch (1-based)")
+    parser.add_argument("--det-paper-hnm-every", type=int, default=1, help="Update HNM weights every N epochs")
+    parser.add_argument("--det-paper-hnm-topk", type=int, default=2000, help="Boost weights for top-K hardest negatives")
+    parser.add_argument("--det-paper-hnm-boost", type=float, default=3.0, help="Weight multiplier for hard negatives")
+    parser.add_argument(
+        "--det-paper-hnm-max-batches",
+        type=int,
+        default=0,
+        help="Limit batches when scoring for HNM (0=all)",
+    )
     parser.add_argument("--det-paper-checkpoint", type=str, default=None)
     parser.add_argument("--det-paper-metrics-csv", type=str, default=None)
     parser.add_argument("--det-paper-index-csv", type=str, default=None)
@@ -1487,15 +2668,93 @@ def main() -> None:
     parser.add_argument("--train-global-paper", action="store_true", help="Run paper-aligned CNN_global training")
     parser.add_argument("--global-paper-epochs", type=int, default=30)
     parser.add_argument("--global-paper-split-seed", type=int, default=1337)
+    parser.add_argument(
+        "--global-paper-cv-folds",
+        type=int,
+        default=1,
+        help="Number of slide-level CV folds (1 keeps 60/20/20; paper uses 3)",
+    )
+    parser.add_argument(
+        "--global-paper-eval-every",
+        type=int,
+        default=1,
+        help="Evaluate on val every N epochs (default 1; set 2 to eval every two epochs)",
+    )
+    parser.add_argument(
+        "--global-paper-parallel-folds",
+        action="store_true",
+        help="Run CV folds in parallel (one process per fold; requires enough devices)",
+    )
+    parser.add_argument(
+        "--global-paper-fold-devices",
+        type=str,
+        default=None,
+        help="Comma/semicolon-separated device list for folds (e.g. npu:0,npu:1,npu:2)",
+    )
+    parser.add_argument(
+        "--global-paper-ensemble-strategy",
+        type=str,
+        default="sum",
+        choices=["sum", "mean"],
+        help="Ensemble strategy for fold models at inference (sum|mean; default sum)",
+    )
+    parser.add_argument(
+        "--global-paper-ensemble-manifest",
+        type=str,
+        default=None,
+        help="Optional path to write ensemble manifest JSON (defaults next to checkpoint)",
+    )
     parser.add_argument("--global-paper-checkpoint", type=str, default=None)
     parser.add_argument("--global-paper-metrics-csv", type=str, default=None)
     parser.add_argument("--global-paper-index-csv", type=str, default=None)
+
+    parser.add_argument(
+        "--global-paper-num-workers",
+        type=int,
+        default=4,
+        help="DataLoader workers per fold (default 4; set 0 for single-process loading)",
+    )
+    parser.add_argument(
+        "--global-paper-prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch_factor when num_workers>0 (default 2)",
+    )
+    parser.add_argument(
+        "--global-paper-no-persistent-workers",
+        action="store_true",
+        help="Disable persistent DataLoader workers for CNN_global paper training",
+    )
+
+    # Internal: fold worker entrypoint (used to run folds in parallel via subprocess)
+    parser.add_argument(
+        "--train-global-paper-fold-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--global-paper-worker-payload",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seg-length", type=int, default=10_000)
     parser.add_argument("--det-length", type=int, default=20_000)
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
+
+    if bool(getattr(args, "train_global_paper_fold_worker", False)):
+        payload_path_s = str(getattr(args, "global_paper_worker_payload", "") or "").strip()
+        if not payload_path_s:
+            raise ValueError("--global-paper-worker-payload is required when --train-global-paper-fold-worker is set")
+        payload_path = Path(payload_path_s)
+        if not payload_path.exists():
+            raise FileNotFoundError(str(payload_path))
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        _train_global_paper_fold_worker(**payload)
+        return
 
     if args.generate_candidates:
         cfg = load_mfc_cnn_config()
@@ -1601,7 +2860,24 @@ def main() -> None:
             tune_epochs=int(args.det_paper_tune_epochs),
             final_epochs=int(args.det_paper_final_epochs),
             device=args.device,
-            split_seed=int(args.det_paper_split_seed)
+            split_seed=int(args.det_paper_split_seed),
+            eval_every=int(args.det_paper_eval_every),
+            eval_max_batches=int(args.det_paper_eval_max_batches),
+            num_workers=int(args.det_paper_num_workers),
+            prefetch_factor=int(args.det_paper_prefetch_factor),
+            persistent_workers=not bool(args.det_paper_no_persistent_workers),
+            balanced_sampler=not bool(args.det_paper_no_balanced_sampler),
+            class_weight_mode=str(args.det_paper_class_weight_mode),
+            pos_weight=float(args.det_paper_pos_weight),
+            focal_gamma=float(args.det_paper_focal_gamma),
+            select_metric=str(args.det_paper_select_metric),
+            hnm_enabled=bool(args.det_paper_hnm),
+            hnm_start_epoch=int(args.det_paper_hnm_start_epoch),
+            hnm_every=int(args.det_paper_hnm_every),
+            hnm_topk=int(args.det_paper_hnm_topk),
+            hnm_boost=float(args.det_paper_hnm_boost),
+            hnm_max_batches=int(args.det_paper_hnm_max_batches),
+            resume=bool(args.det_paper_resume),
         )
         return
 
@@ -1623,11 +2899,22 @@ def main() -> None:
             else (cfg.output_dir / "global_patches" / "index.csv")
         )
 
+        ensemble_manifest = Path(args.global_paper_ensemble_manifest) if args.global_paper_ensemble_manifest else None
+
         _train_global_paper(
             index_csv=index_csv,
             checkpoint_path=checkpoint_path,
             metrics_csv=metrics_csv,
+            cv_folds=int(args.global_paper_cv_folds),
+            eval_every=int(args.global_paper_eval_every),
+            parallel_folds=bool(args.global_paper_parallel_folds),
+            fold_devices=str(args.global_paper_fold_devices) if args.global_paper_fold_devices else None,
+            ensemble_strategy=str(args.global_paper_ensemble_strategy),
+            ensemble_manifest=ensemble_manifest,
             batch_size=int(args.global_batch_size),
+            num_workers=int(args.global_paper_num_workers),
+            prefetch_factor=int(args.global_paper_prefetch_factor),
+            persistent_workers=not bool(args.global_paper_no_persistent_workers),
             epochs=int(args.global_paper_epochs),
             lr=float(args.global_lr),
             momentum=float(args.global_momentum),
@@ -1691,7 +2978,31 @@ def main() -> None:
             max_tiles=None if int(args.det_max_tiles) <= 0 else int(args.det_max_tiles),
             max_candidates_per_tile=int(args.det_max_candidates_per_tile),
             max_negatives_per_positive=int(args.det_max_neg_per_pos),
+            match_radius=int(args.det_match_radius),
+            add_gt_patches=bool(args.det_add_gt_patches),
+            gt_patches_missing_only=not bool(args.det_gt_patches_all),
+            min_region_area=int(args.det_min_region_area),
+            min_region_mean_prob=float(args.det_min_region_mean_prob),
+            min_region_max_prob=float(args.det_min_region_max_prob),
             seed=int(cfg.seed),
+            collect_rows=False,
+        )
+        return
+
+    if args.qa_det_index:
+        cfg = load_mfc_cnn_config()
+        index_csv = (
+            Path(args.qa_det_index_csv)
+            if args.qa_det_index_csv
+            else (cfg.output_dir / "det_patches" / "index.csv")
+        )
+        out_dir = Path(args.qa_det_out_dir) if args.qa_det_out_dir else (Path(index_csv).parent / "qa")
+        _qa_det_index(
+            index_csv=Path(index_csv),
+            out_dir=Path(out_dir),
+            radius=int(args.qa_det_radius),
+            samples=int(args.qa_det_samples),
+            seed=int(args.qa_det_seed),
         )
         return
 
@@ -1741,43 +3052,6 @@ def main() -> None:
             resume=not bool(args.no_resume),
         )
         logger.info("Done. index_csv=%s", str(index_csv))
-        return
-
-    if args.train_global_paper:
-        cfg = load_mfc_cnn_config()
-        checkpoint_path = (
-            Path(args.global_paper_checkpoint)
-            if args.global_paper_checkpoint
-            else (cfg.output_dir / "models" / "cnn_global_paper.pt")
-        )
-        metrics_csv = (
-            Path(args.global_paper_metrics_csv)
-            if args.global_paper_metrics_csv
-            else (cfg.output_dir / "models" / "global_metrics.csv")
-        )
-        index_csv = (
-            Path(args.global_paper_index_csv)
-            if args.global_paper_index_csv
-            else (cfg.output_dir / "global_patches" / "index.csv")
-        )
-
-        _train_global_paper(
-            index_csv=index_csv,
-            checkpoint_path=checkpoint_path,
-            metrics_csv=metrics_csv,
-            batch_size=int(args.global_batch_size),
-            epochs=int(args.global_paper_epochs),
-            lr=float(args.global_lr),
-            momentum=float(args.global_momentum),
-            weight_decay=float(args.global_weight_decay),
-            max_steps=int(args.global_max_steps),
-            device=args.device,
-            pretrained=bool(cfg.pretrained),
-            split_seed=int(args.global_paper_split_seed),
-            augment=not bool(args.no_global_augment),
-            color_jitter=float(args.global_color_jitter),
-            balance=not bool(args.no_global_balance),
-        )
         return
 
     if args.train_global:
@@ -1961,13 +3235,238 @@ def _train_global(
     )
     logger.info("Saved CNNGlobal checkpoint: %s", str(checkpoint_path))
 
+def _train_global_paper_fold_worker(
+    *,
+    index_csv: str,
+    train_slide_ids: list[str],
+    val_slide_ids: list[str],
+    test_slide_ids: list[str],
+    checkpoint_path: str,
+    metrics_csv: str,
+    device: str,
+    batch_size: int,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    epochs: int,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    max_steps: int,
+    pretrained: bool,
+    augment: bool,
+    color_jitter: float,
+    balance: bool,
+    eval_every: int,
+    cv_folds: int,
+    ensemble_strategy: str,
+    split_payload: dict[str, object],
+) -> None:
+    """Train one fold/run of CNN_global(paper) given slide splits.
+
+    Designed as a top-level function so it can be launched in a subprocess.
+    """
+
+    metrics_csv_p = Path(metrics_csv)
+    _append_metrics_row(metrics_csv_p, {"event": "start", "device": str(device), **split_payload})
+
+    rows = read_global_patch_index(Path(index_csv))
+    train_slides = set(str(s) for s in train_slide_ids)
+    val_slides = set(str(s) for s in val_slide_ids)
+    test_slides = set(str(s) for s in test_slide_ids)
+
+    train_rows = [r for r in rows if r.slide_id in train_slides]
+    val_rows = [r for r in rows if r.slide_id in val_slides]
+    test_rows = [r for r in rows if r.slide_id in test_slides]
+
+    train_transform = _build_global_train_transform(augment=bool(augment), color_jitter=float(color_jitter))
+    train_ds = GlobalScoringPatchDataset(rows=train_rows, transform=train_transform, normalize_imagenet=True)
+    val_ds = GlobalScoringPatchDataset(rows=val_rows, transform=None, normalize_imagenet=True)
+    test_ds = GlobalScoringPatchDataset(rows=test_rows, transform=None, normalize_imagenet=True)
+
+    sampler: WeightedRandomSampler | None = None
+    shuffle = True
+    if bool(balance):
+        labels = [int(r.label) for r in train_rows]
+        counts: dict[int, int] = {}
+        for l in labels:
+            counts[l] = counts.get(l, 0) + 1
+        weights = [1.0 / float(counts[int(l)]) for l in labels]
+        sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+        shuffle = False
+        logger.info("Global train balance: %s", str(counts))
+
+    num_workers_i = max(0, int(num_workers))
+    prefetch_factor_i = max(1, int(prefetch_factor))
+    persistent_workers_b = bool(persistent_workers) and num_workers_i > 0
+
+    train_loader_kwargs: dict[str, object] = {
+        "batch_size": int(batch_size),
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "num_workers": int(num_workers_i),
+        "persistent_workers": bool(persistent_workers_b),
+    }
+    eval_loader_kwargs: dict[str, object] = {
+        "batch_size": int(batch_size),
+        "shuffle": False,
+        "num_workers": int(num_workers_i),
+        "persistent_workers": bool(persistent_workers_b),
+    }
+    if num_workers_i > 0:
+        train_loader_kwargs["prefetch_factor"] = int(prefetch_factor_i)
+        eval_loader_kwargs["prefetch_factor"] = int(prefetch_factor_i)
+
+    train_loader = DataLoader(train_ds, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, **eval_loader_kwargs)
+    test_loader = DataLoader(test_ds, **eval_loader_kwargs)
+
+    device_t = _resolve_torch_device(str(device))
+    model = CNNGlobal(pretrained=bool(pretrained)).to(device_t)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=float(lr),
+        momentum=float(momentum),
+        weight_decay=float(weight_decay),
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    eval_every_i = max(1, int(eval_every))
+    best_acc = 0.0
+    best_state: dict[str, torch.Tensor] | None = None
+
+    for epoch in range(int(epochs)):
+        epoch_idx = epoch + 1
+        model.train()
+
+        train_loss_sum = 0.0
+        correct = 0
+        total = 0
+        steps = 0
+
+        for images, labels in train_loader:
+            images = images.to(device_t)
+            labels = labels.to(device_t)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += float(loss.detach().cpu())
+            preds = logits.argmax(dim=1)
+            correct += int((preds == labels).sum().cpu())
+            total += int(labels.numel())
+            steps += 1
+            if int(max_steps) > 0 and steps >= int(max_steps):
+                break
+
+        train_loss = train_loss_sum / max(1, steps)
+        train_acc = float(correct / max(1, total))
+
+        do_eval = eval_every_i <= 1 or (epoch_idx % eval_every_i == 0) or (epoch_idx == int(epochs))
+        val_loss = float("nan")
+        val_acc = float("nan")
+        test_loss = float("nan")
+        test_acc = float("nan")
+
+        if bool(do_eval):
+            val_loss, val_acc = _eval_global(model=model, loader=val_loader, criterion=criterion, device=device_t)
+            # Only run test at the end to reduce eval overhead.
+            if epoch_idx == int(epochs):
+                test_loss, test_acc = _eval_global(model=model, loader=test_loader, criterion=criterion, device=device_t)
+
+            logger.info(
+                "Global epoch=%d train_loss=%.4f train_acc=%.3f val_loss=%.4f val_acc=%.3f",
+                epoch_idx,
+                train_loss,
+                train_acc,
+                float(val_loss),
+                float(val_acc),
+            )
+        else:
+            logger.info(
+                "Global epoch=%d train_loss=%.4f train_acc=%.3f (skip eval; eval_every=%d)",
+                epoch_idx,
+                train_loss,
+                train_acc,
+                int(eval_every_i),
+            )
+
+        _append_metrics_row(
+            metrics_csv_p,
+            {
+                "epoch": int(epoch_idx),
+                "train_loss": float(train_loss),
+                "train_acc": float(train_acc),
+                "val_loss": float(val_loss),
+                "val_acc": float(val_acc),
+                "test_loss": float(test_loss),
+                "test_acc": float(test_acc),
+                **split_payload,
+            },
+        )
+
+        if bool(do_eval) and (not np.isnan(val_acc)) and float(val_acc) > float(best_acc):
+            best_acc = float(val_acc)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Final evaluation of the selected model.
+    final_val_loss, final_val_acc = _eval_global(model=model, loader=val_loader, criterion=criterion, device=device_t)
+    final_test_loss, final_test_acc = _eval_global(model=model, loader=test_loader, criterion=criterion, device=device_t)
+    _append_metrics_row(
+        metrics_csv_p,
+        {
+            "event": "final",
+            "best_val_acc": float(best_acc),
+            "val_loss": float(final_val_loss),
+            "val_acc": float(final_val_acc),
+            "test_loss": float(final_test_loss),
+            "test_acc": float(final_test_acc),
+            "device": str(device),
+            **split_payload,
+        },
+    )
+
+    torch.save(
+        {
+            "model": "CNNGlobal",
+            "paper_aligned": True,
+            "cv_folds": int(cv_folds),
+            "ensemble_strategy": str(ensemble_strategy),
+            "eval_every": int(eval_every_i),
+            "device": str(device),
+            **split_payload,
+            "state_dict": model.state_dict(),
+        },
+        Path(checkpoint_path),
+    )
+    logger.info(
+        "Saved CNN_global(paper) checkpoint: %s (best_val_acc=%.3f)",
+        str(checkpoint_path),
+        float(best_acc),
+    )
+
 
 def _train_global_paper(
     *,
     index_csv: Path,
     checkpoint_path: Path,
     metrics_csv: Path,
+    cv_folds: int,
+    eval_every: int,
+    parallel_folds: bool,
+    fold_devices: str | None,
+    ensemble_strategy: str,
+    ensemble_manifest: Path | None,
     batch_size: int,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
     epochs: int,
     lr: float,
     momentum: float,
@@ -1980,172 +3479,334 @@ def _train_global_paper(
     color_jitter: float,
     balance: bool,
 ) -> None:
-    """Train CNN_global with paper-aligned 60/20/20 slide split.
-    
-    TUPAC16 Main training set is effectively the entire universe here.
+    """Train CNN_global using paper-aligned logic.
+
+    - If `cv_folds <= 1`: keep the existing stratified 60/20/20 slide split.
+    - If `cv_folds >= 2`: run stratified K-fold cross-validation at slide-level and
+      save one best checkpoint per fold. This matches the paper's ensemble setup.
     """
-    
+
+    def _parse_devices(s: str | None) -> list[str]:
+        if not s:
+            return []
+        parts = [p.strip() for p in re.split(r"[;,]", str(s))]
+        return [p for p in parts if p]
+
     index_csv = Path(index_csv)
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_csv = Path(metrics_csv)
-    _append_metrics_row(metrics_csv, {"event": "start", "device": device})
-    
+
+    cv_folds_i = int(cv_folds)
+    if cv_folds_i < 1:
+        raise ValueError("--global-paper-cv-folds must be >= 1")
+
+    eval_every_i = int(eval_every)
+    if eval_every_i < 1:
+        raise ValueError("--global-paper-eval-every must be >= 1")
+
+    ensemble_strategy_i = str(ensemble_strategy).lower().strip()
+    if ensemble_strategy_i not in {"sum", "mean"}:
+        raise ValueError("--global-paper-ensemble-strategy must be: sum|mean")
+
     rows = read_global_patch_index(index_csv)
-    
-    # Paper logic: "Split on Slide cases" 60/20/20
-    slide_ids = sorted(list(set(r.slide_id for r in rows)))
-    # Optional: Stratified by score if score is known per slide
-    # We can infer score from patch labels (since all patches from a slide share label)
-    slide_to_label = {}
+
+    slide_to_label: dict[str, int] = {}
     for r in rows:
-        if r.slide_id not in slide_to_label:
-            slide_to_label[r.slide_id] = int(r.label)
-            
-    # Group slides by label
-    by_label = {}
-    for sid, lbl in slide_to_label.items():
-        by_label.setdefault(lbl, []).append(sid)
-        
-    rng = random.Random(int(split_seed))
-    
-    train_slides = set()
-    val_slides = set()
-    test_slides = set()
-    
-    for lbl, group in by_label.items():
-        rng.shuffle(group)
-        n = len(group)
-        n_train = int(0.6 * n)
-        n_val = int(0.2 * n)
-        # Remaining goes to test (approx 20%)
-        
-        train_slides.update(group[:n_train])
-        val_slides.update(group[n_train:n_train+n_val])
-        test_slides.update(group[n_train+n_val:])
-        
-    train_rows = [r for r in rows if r.slide_id in train_slides]
-    val_rows = [r for r in rows if r.slide_id in val_slides]
-    test_rows = [r for r in rows if r.slide_id in test_slides]
-    
-    logger.info(
-        "Global paper split (slides): total=%d train=%d val=%d test=%d",
-        len(slide_ids), len(train_slides), len(val_slides), len(test_slides)
-    )
-    logger.info(
-        "Global paper split (patches): total=%d train=%d val=%d test=%d",
-        len(rows), len(train_rows), len(val_rows), len(test_rows)
-    )
+        slide_to_label.setdefault(r.slide_id, int(r.label))
 
-    train_transform = _build_global_train_transform(augment=bool(augment), color_jitter=float(color_jitter))
-    
-    # Datasets
-    # Note: GlobalScoringPatchDataset resizes to 227x227
-    train_ds = GlobalScoringPatchDataset(rows=train_rows, transform=train_transform, normalize_imagenet=True)
-    val_ds = GlobalScoringPatchDataset(rows=val_rows, transform=None, normalize_imagenet=True)
-    test_ds = GlobalScoringPatchDataset(rows=test_rows, transform=None, normalize_imagenet=True)
-    
-    # Sampler for train? (Paper doesn't explicitly mention balancing but usually done)
-    # Using 'balance' flag behavior.
-    sampler = None
-    shuffle = True
-    if balance:
-        labels = [int(r.label) for r in train_rows] # 1,2,3
-        # If labels are 1-based, we can just use them as keys or map to 0-based for unique counting
-        # Loader expects 0-based tensors but dataset does the conversion.
-        # Here we just need counts.
-        counts: dict[int, int] = {}
-        for l in labels:
-            counts[l] = counts.get(l, 0) + 1
-        weights = [1.0 / float(counts[int(l)]) for l in labels]
-        sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-        shuffle = False
-        logger.info("Global train balance: %s", str(counts))
+    slide_ids = sorted(list(slide_to_label.keys()))
 
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=shuffle, sampler=sampler, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=int(batch_size), shuffle=False, num_workers=0)
+    if cv_folds_i == 1:
+        _append_metrics_row(metrics_csv, {"event": "start", "device": str(device), "cv_folds": 1})
 
-    device_t = _resolve_torch_device(device)
-    model = CNNGlobal(pretrained=bool(pretrained)).to(device_t)
-    optimizer = torch.optim.SGD(
-        model.parameters(), 
-        lr=float(lr), 
-        momentum=float(momentum), 
-        weight_decay=float(weight_decay)
-    )
-    criterion = nn.CrossEntropyLoss()
-    
-    best_acc = 0.0
-    best_state = None
-    
-    for epoch in range(int(epochs)):
-        epoch_idx = epoch + 1
-        model.train()
-        
-        train_loss_sum = 0.0
-        correct = 0
-        total = 0
-        steps = 0
-        
-        for images, labels in train_loader:
-            images = images.to(device_t)
-            labels = labels.to(device_t)
-            
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss_sum += float(loss.detach().cpu())
-            preds = logits.argmax(dim=1)
-            correct += int((preds == labels).sum().cpu())
-            total += int(labels.numel())
-            steps += 1
-            if max_steps > 0 and steps >= int(max_steps):
-                break
-                
-        train_loss = train_loss_sum / max(1, steps)
-        train_acc = float(correct / max(1, total))
-        
-        # Validation
-        val_loss, val_acc = _eval_global(model=model, loader=val_loader, criterion=criterion, device=device_t)
-        # Test (Monitor)
-        test_loss, test_acc = _eval_global(model=model, loader=test_loader, criterion=criterion, device=device_t)
-        
+        by_label: dict[int, list[str]] = {}
+        for sid, lbl in slide_to_label.items():
+            by_label.setdefault(int(lbl), []).append(sid)
+
+        rng = random.Random(int(split_seed))
+        train_slides: set[str] = set()
+        val_slides: set[str] = set()
+        test_slides: set[str] = set()
+
+        for group in by_label.values():
+            rng.shuffle(group)
+            n = len(group)
+            n_train = int(0.6 * n)
+            n_val = int(0.2 * n)
+            train_slides.update(group[:n_train])
+            val_slides.update(group[n_train : n_train + n_val])
+            test_slides.update(group[n_train + n_val :])
+
+        train_rows = [r for r in rows if r.slide_id in train_slides]
+        val_rows = [r for r in rows if r.slide_id in val_slides]
+        test_rows = [r for r in rows if r.slide_id in test_slides]
+
         logger.info(
-            "Global paper epoch=%d train_loss=%.4f train_acc=%.3f val_loss=%.4f val_acc=%.3f test_acc=%.3f",
-            epoch_idx, train_loss, train_acc, val_loss, val_acc, test_acc
+            "Global paper split (slides): total=%d train=%d val=%d test=%d",
+            len(slide_ids),
+            len(train_slides),
+            len(val_slides),
+            len(test_slides),
         )
-        
-        _append_metrics_row(metrics_csv, {
-            "epoch": epoch_idx,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
-            "test_loss": test_loss,
-            "test_acc": test_acc
-        })
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        
-    torch.save(
-        {
-            "model": "CNNGlobal",
-            "paper_aligned": True,
-            "split": {"train": 0.6, "val": 0.2, "test": 0.2},
-            "state_dict": model.state_dict()
-        },
-        checkpoint_path
-    )
-    logger.info("Saved CNN_global(paper) checkpoint: %s (best_val_acc=%.3f)", str(checkpoint_path), best_acc)
+        logger.info(
+            "Global paper split (patches): total=%d train=%d val=%d test=%d",
+            len(rows),
+            len(train_rows),
+            len(val_rows),
+            len(test_rows),
+        )
+
+        _train_global_paper_fold_worker(
+            index_csv=str(index_csv),
+            train_slide_ids=sorted(list(train_slides)),
+            val_slide_ids=sorted(list(val_slides)),
+            test_slide_ids=sorted(list(test_slides)),
+            checkpoint_path=str(checkpoint_path),
+            metrics_csv=str(metrics_csv),
+            device=str(device),
+            batch_size=int(batch_size),
+            num_workers=int(num_workers),
+            prefetch_factor=int(prefetch_factor),
+            persistent_workers=bool(persistent_workers),
+            epochs=int(epochs),
+            lr=float(lr),
+            momentum=float(momentum),
+            weight_decay=float(weight_decay),
+            max_steps=int(max_steps),
+            pretrained=bool(pretrained),
+            augment=bool(augment),
+            color_jitter=float(color_jitter),
+            balance=bool(balance),
+            eval_every=int(eval_every_i),
+            cv_folds=int(cv_folds_i),
+            ensemble_strategy=str(ensemble_strategy_i),
+            split_payload={
+                "cv_folds": 1,
+                "split_seed": int(split_seed),
+                "split": {"train": 0.6, "val": 0.2, "test": 0.2},
+            },
+        )
+        return
+
+    # --- K-fold CV (paper-style) ---
+    by_label: dict[int, list[str]] = {}
+    for sid, lbl in slide_to_label.items():
+        by_label.setdefault(int(lbl), []).append(sid)
+    rng = random.Random(int(split_seed))
+    for group in by_label.values():
+        rng.shuffle(group)
+
+    folds: list[set[str]] = [set() for _ in range(cv_folds_i)]
+    for _, group in by_label.items():
+        for i, sid in enumerate(group):
+            folds[i % cv_folds_i].add(sid)
+
+    all_slides = set(slide_ids)
+    fold_ckpts: list[str] = []
+    fold_metrics: list[str] = []
+
+    devices = _parse_devices(fold_devices)
+    if bool(parallel_folds) and not devices:
+        # If parallel folds requested but no per-fold devices provided, fall back to
+        # a single device list. This will still run folds with limited concurrency.
+        devices = [str(device)]
+
+    fold_jobs: list[dict[str, object]] = []
+
+    for fold_idx in range(cv_folds_i):
+        val_slides = set(folds[fold_idx])
+        train_slides = set(all_slides.difference(val_slides))
+
+        train_rows = [r for r in rows if r.slide_id in train_slides]
+        val_rows = [r for r in rows if r.slide_id in val_slides]
+        # CV: no separate test; we mirror val into test to keep logging schema stable.
+        test_rows = val_rows
+
+        fold_checkpoint = checkpoint_path.with_name(
+            f"{checkpoint_path.stem}_fold{fold_idx + 1}{checkpoint_path.suffix}"
+        )
+        fold_metrics_csv = metrics_csv.with_name(f"{metrics_csv.stem}_fold{fold_idx + 1}{metrics_csv.suffix}")
+        fold_ckpts.append(str(fold_checkpoint))
+        fold_metrics.append(str(fold_metrics_csv))
+
+        logger.info(
+            "Global CV fold=%d/%d slides: train=%d val=%d (seed=%d)",
+            fold_idx + 1,
+            cv_folds_i,
+            len(train_slides),
+            len(val_slides),
+            int(split_seed),
+        )
+        logger.info(
+            "Global CV fold=%d/%d patches: train=%d val=%d",
+            fold_idx + 1,
+            cv_folds_i,
+            len(train_rows),
+            len(val_rows),
+        )
+
+        fold_jobs.append(
+            {
+                "fold": int(fold_idx + 1),
+                "train_slide_ids": sorted(list(train_slides)),
+                "val_slide_ids": sorted(list(val_slides)),
+                "test_slide_ids": sorted(list(val_slides)),
+                "checkpoint_path": str(fold_checkpoint),
+                "metrics_csv": str(fold_metrics_csv),
+                "split_payload": {
+                    "cv_folds": int(cv_folds_i),
+                    "fold": int(fold_idx + 1),
+                    "split_seed": int(split_seed),
+                    "val_slides": sorted(list(val_slides)),
+                },
+            }
+        )
+
+    if bool(parallel_folds) and len(devices) > 1:
+        import os
+        import subprocess
+        import sys
+        import time
+
+        available_devices: list[str] = list(devices)
+        pending = list(fold_jobs)
+        # (proc, device, fold, payload_path, log_fp)
+        running: list[tuple[subprocess.Popen[bytes], str, int, Path, object]] = []
+
+        logger.info("Global CV: running folds in parallel (devices=%s)", ",".join(devices))
+
+        while pending or running:
+            # Launch new jobs if we have free devices.
+            while pending and available_devices:
+                job = pending.pop(0)
+                dev = available_devices.pop(0)
+                fold_n = int(job["fold"])  # type: ignore[arg-type]
+
+                payload = {
+                    "index_csv": str(index_csv),
+                    "train_slide_ids": list(job["train_slide_ids"]),
+                    "val_slide_ids": list(job["val_slide_ids"]),
+                    "test_slide_ids": list(job["test_slide_ids"]),
+                    "checkpoint_path": str(job["checkpoint_path"]),
+                    "metrics_csv": str(job["metrics_csv"]),
+                    "device": str(dev),
+                    "batch_size": int(batch_size),
+                    "num_workers": int(num_workers),
+                    "prefetch_factor": int(prefetch_factor),
+                    "persistent_workers": bool(persistent_workers),
+                    "epochs": int(epochs),
+                    "lr": float(lr),
+                    "momentum": float(momentum),
+                    "weight_decay": float(weight_decay),
+                    "max_steps": int(max_steps),
+                    "pretrained": bool(pretrained),
+                    "augment": bool(augment),
+                    "color_jitter": float(color_jitter),
+                    "balance": bool(balance),
+                    "eval_every": int(eval_every_i),
+                    "cv_folds": int(cv_folds_i),
+                    "ensemble_strategy": str(ensemble_strategy_i),
+                    "split_payload": dict(job["split_payload"]),
+                }
+
+                payload_path = Path(str(job["metrics_csv"])).with_suffix(".payload.json")
+                payload_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+                fold_log = Path(str(job["metrics_csv"])).with_suffix(".log")
+                fold_log.parent.mkdir(parents=True, exist_ok=True)
+                log_fp = fold_log.open("w", encoding="utf-8")
+
+                env = dict(os.environ)
+                env.setdefault("PYTHONUNBUFFERED", "1")
+
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "cabcds.mf_cnn",
+                        "--train-global-paper-fold-worker",
+                        "--global-paper-worker-payload",
+                        str(payload_path),
+                    ],
+                    stdout=log_fp,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+                running.append((proc, dev, fold_n, payload_path, log_fp))
+                logger.info("Global CV: started fold=%d on device=%s pid=%d log=%s", fold_n, dev, int(proc.pid or -1), str(fold_log))
+
+            # Reap finished.
+            still_running: list[tuple[subprocess.Popen[bytes], str, int, Path, object]] = []
+            for proc, dev, fold_n, payload_path, log_fp in running:
+                rc = proc.poll()
+                if rc is None:
+                    still_running.append((proc, dev, fold_n, payload_path, log_fp))
+                    continue
+
+                try:
+                    proc.wait(timeout=0.1)
+                except Exception:
+                    pass
+
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
+
+                available_devices.append(dev)
+                if int(rc) != 0:
+                    raise RuntimeError(f"Global CV fold {fold_n} failed (returncode={rc}) payload={payload_path}")
+                logger.info("Global CV: finished fold=%d on device=%s", fold_n, dev)
+
+            running = still_running
+            if running and (not available_devices or not pending):
+                time.sleep(5)
+    else:
+        # Sequential (or parallel requested but only one device provided)
+        for job in fold_jobs:
+            fold_n = int(job["fold"])  # type: ignore[arg-type]
+            dev = devices[fold_n - 1] if devices and len(devices) >= fold_n else str(device)
+            _train_global_paper_fold_worker(
+                index_csv=str(index_csv),
+                train_slide_ids=list(job["train_slide_ids"]),
+                val_slide_ids=list(job["val_slide_ids"]),
+                test_slide_ids=list(job["test_slide_ids"]),
+                checkpoint_path=str(job["checkpoint_path"]),
+                metrics_csv=str(job["metrics_csv"]),
+                device=str(dev),
+                batch_size=int(batch_size),
+                num_workers=int(num_workers),
+                prefetch_factor=int(prefetch_factor),
+                persistent_workers=bool(persistent_workers),
+                epochs=int(epochs),
+                lr=float(lr),
+                momentum=float(momentum),
+                weight_decay=float(weight_decay),
+                max_steps=int(max_steps),
+                pretrained=bool(pretrained),
+                augment=bool(augment),
+                color_jitter=float(color_jitter),
+                balance=bool(balance),
+                eval_every=int(eval_every_i),
+                cv_folds=int(cv_folds_i),
+                ensemble_strategy=str(ensemble_strategy_i),
+                split_payload=dict(job["split_payload"]),
+            )
+
+    manifest_path = Path(ensemble_manifest) if ensemble_manifest is not None else checkpoint_path.with_suffix(".ensemble.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "model": "CNNGlobal",
+        "paper_aligned": True,
+        "cv_folds": int(cv_folds_i),
+        "split_seed": int(split_seed),
+        "ensemble_strategy": str(ensemble_strategy_i),
+        "checkpoints": fold_ckpts,
+        "metrics": fold_metrics,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Saved CNN_global ensemble manifest: %s", str(manifest_path))
 
 
 def _train_seg(
