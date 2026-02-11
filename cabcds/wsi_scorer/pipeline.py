@@ -14,6 +14,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from cabcds.hybrid_descriptor.descriptor import HYBRID_DESCRIPTOR_FEATURE_NAMES
 from cabcds.wsi_scorer.config import WsiScorerConfig
 
 
@@ -237,13 +238,26 @@ def _parse_feature_row(row: dict[str, str]) -> np.ndarray:
         Feature vector.
     """
 
-    values: list[float] = []
-    for index in range(1, 16):
-        key = f"feature_{index}"
+    # Legacy format: feature_1..feature_15
+    if "feature_1" in row:
+        values: list[float] = []
+        for index in range(1, 16):
+            key = f"feature_{index}"
+            if key not in row:
+                raise ValueError(f"Missing {key} in descriptor row.")
+            values.append(float(row[key]))
+        return np.array(values, dtype=np.float32)
+
+    # New format: semantic feature names.
+    values_named: list[float] = []
+    for key in HYBRID_DESCRIPTOR_FEATURE_NAMES:
         if key not in row:
-            raise ValueError(f"Missing {key} in descriptor row.")
-        values.append(float(row[key]))
-    return np.array(values, dtype=np.float32)
+            raise ValueError(
+                "Descriptor CSV missing expected feature column. "
+                f"Missing '{key}'. Available keys: {sorted(row.keys())}"
+            )
+        values_named.append(float(row[key]))
+    return np.array(values_named, dtype=np.float32)
 
 
 def _load_label_map(labels_csv: Path) -> dict[str, int]:
