@@ -97,6 +97,26 @@ class HybridDescriptorBuilder:
         return descriptor
 
 
+# Public feature names in the exact order produced by `HybridDescriptorBuilder.build()`.
+HYBRID_DESCRIPTOR_FEATURE_NAMES: tuple[str, ...] = (
+    "avg_blob_area",
+    "blob_count_max",
+    "blob_count_min",
+    "blob_count_mean",
+    "blob_count_sd",
+    "mitosis_count_max",
+    "mitosis_count_min",
+    "mitosis_count_mean",
+    "mitosis_count_sd",
+    "br_score_max",
+    "br_score_min",
+    "br_score_mean",
+    "mitosis_per_blob_mean",
+    "mitosis_per_blob_max",
+    "roi_score",
+)
+
+
 def _safe_divide(numerator: float, denominator: float) -> float:
     """Safely divide two scalars.
 

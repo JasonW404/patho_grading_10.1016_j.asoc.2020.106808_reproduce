@@ -33,7 +33,10 @@ class HybridDescriptorInferenceConfig(BaseSettings):
         output_dir: Directory for descriptor outputs.
         segmentation_model_path: Path to CNN_seg model weights.
         detection_model_path: Path to CNN_det model weights.
-        roi_scoring_model_path: Path to CNN_global model weights.
+        roi_scoring_model_path: Path(s) to CNN_global model weights. For ensembles,
+            provide a comma/semicolon-separated list of checkpoint paths.
+        roi_scoring_ensemble_strategy: How to combine multiple CNN_global models
+            (sum|mean over softmax probabilities).
         device: Torch device string.
         image_extensions: Allowed image extensions.
         min_blob_area: Minimum blob area for segmentation blobs.
@@ -55,6 +58,7 @@ class HybridDescriptorInferenceConfig(BaseSettings):
     segmentation_model_path: str | None = Field(default=None)
     detection_model_path: str | None = Field(default=None)
     roi_scoring_model_path: str | None = Field(default=None)
+    roi_scoring_ensemble_strategy: str = Field(default="sum")
     device: str = Field(default="cpu")
     image_extensions: tuple[str, ...] = Field(
         default=(".png", ".jpg", ".jpeg", ".tif", ".tiff")

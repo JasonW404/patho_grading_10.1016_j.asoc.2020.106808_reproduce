@@ -22,9 +22,40 @@ from cabcds.hybrid_descriptor.config import (
     HybridDescriptorInferenceConfig,
 )
 from cabcds.hybrid_descriptor.descriptor import HybridDescriptorBuilder, RoiMetrics
+from cabcds.hybrid_descriptor.descriptor import HYBRID_DESCRIPTOR_FEATURE_NAMES
 from cabcds.mf_cnn.cnn import CNNDet
 from cabcds.mf_cnn.mitosis_segmentation_net import CNNSeg
 from cabcds.mf_cnn.roi_scoring_net import RoiScoringNet
+
+
+def _resolve_torch_device(device: str) -> torch.device:
+    """Resolve a torch device string including Ascend NPUs.
+
+    Supported values:
+    - cpu
+    - cuda (NVIDIA)
+    - mps (Apple)
+    - npu (Huawei Ascend via torch_npu)
+    """
+
+    device_s = str(device).lower().strip()
+    if device_s.startswith("npu"):
+        try:
+            # Import registers the `npu` device type in torch.
+            import torch_npu  # noqa: F401
+        except Exception as e:
+            raise RuntimeError(
+                f"Requested device='{device}' but torch_npu could not be imported. "
+                "This usually means the Ascend runtime libraries are not on LD_LIBRARY_PATH. "
+                "Try: `source /usr/local/Ascend/ascend-toolkit/set_env.sh` in the same shell, then rerun. "
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+
+        if device_s == "npu":
+            return torch.device("npu:0")
+        return torch.device(device_s)
+
+    return torch.device(device_s)
 
 
 def _torch_load_compat(path: str, *, map_location: torch.device) -> object:
@@ -61,8 +92,8 @@ class RoiPatchEntry:
 class RoiPatchDataset(Dataset[RoiPatchEntry]):
     """Dataset of ROI patch entries."""
 
-    def __init__(self, root_dir: Path, extensions: tuple[str, ...]) -> None:
-        self.entries = _collect_roi_patches(root_dir, extensions)
+    def __init__(self, root_dir: Path, extensions: tuple[str, ...], *, groups: list[str] | None = None) -> None:
+        self.entries = _collect_roi_patches(root_dir, extensions, groups=groups)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -85,7 +116,7 @@ class HybridDescriptorPipeline:
         self.hybrid_config = hybrid_config
         self.infer_config = infer_config
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.device = torch.device(infer_config.device)
+        self.device = _resolve_torch_device(infer_config.device)
 
         self.segmentation_model = segmentation_model or _load_segmentation_model(infer_config, self.device)
         self.detection_model = detection_model or _load_detection_model(infer_config, self.device)
@@ -94,7 +125,7 @@ class HybridDescriptorPipeline:
         self.roi_transform = _build_imagenet_transform(infer_config.roi_resize)
         self.det_transform = _build_imagenet_transform(infer_config.detection_resize)
 
-    def run(self) -> dict[str, np.ndarray]:
+    def run(self, *, groups: list[str] | None = None) -> dict[str, np.ndarray]:
         """Build hybrid descriptors for ROI patches.
 
         Returns:
@@ -102,7 +133,7 @@ class HybridDescriptorPipeline:
         """
 
         roi_root = Path(self.infer_config.roi_patches_dir)
-        dataset = RoiPatchDataset(roi_root, self.infer_config.image_extensions)
+        dataset = RoiPatchDataset(roi_root, self.infer_config.image_extensions, groups=groups)
         if len(dataset) == 0:
             raise FileNotFoundError(f"No ROI patches found in {roi_root}.")
 
@@ -268,7 +299,7 @@ class HybridDescriptorPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         report_path = output_dir / "stage_four_hybrid_descriptors.csv"
 
-        header = "group," + ",".join(f"feature_{idx}" for idx in range(1, 16)) + "\n"
+        header = "group," + ",".join(HYBRID_DESCRIPTOR_FEATURE_NAMES) + "\n"
         with report_path.open("w", encoding="utf-8") as file_handle:
             file_handle.write(header)
             for group, descriptor in descriptors.items():
@@ -278,7 +309,9 @@ class HybridDescriptorPipeline:
         self.logger.info("Saved hybrid descriptors to %s", report_path)
 
 
-def _collect_roi_patches(root_dir: Path, extensions: tuple[str, ...]) -> list[RoiPatchEntry]:
+def _collect_roi_patches(
+    root_dir: Path, extensions: tuple[str, ...], *, groups: list[str] | None = None
+) -> list[RoiPatchEntry]:
     """Collect ROI patch files.
 
     Args:
@@ -293,10 +326,23 @@ def _collect_roi_patches(root_dir: Path, extensions: tuple[str, ...]) -> list[Ro
     if not root_dir.exists():
         return entries
 
-    for path in root_dir.rglob("*"):
-        if path.is_file() and path.suffix.lower() in {ext.lower() for ext in extensions}:
-            group = path.parent.name
-            entries.append(RoiPatchEntry(path=path, group=group))
+    group_set = set(groups) if groups is not None else None
+
+    # Only traverse allowed group directories if provided.
+    roots: list[Path]
+    if group_set is None:
+        roots = [root_dir]
+    else:
+        roots = [root_dir / group for group in sorted(group_set)]
+
+    ext_set = {ext.lower() for ext in extensions}
+    for r in roots:
+        if not r.exists():
+            continue
+        for path in r.rglob("*"):
+            if path.is_file() and path.suffix.lower() in ext_set:
+                group = path.parent.name
+                entries.append(RoiPatchEntry(path=path, group=group))
     return sorted(entries, key=lambda entry: entry.path.as_posix())
 
 
@@ -349,18 +395,57 @@ def _load_roi_scoring_model(
 
     if config.roi_scoring_model_path is None:
         return None
-    model = RoiScoringNet(pretrained=False)
-    payload = _torch_load_compat(str(config.roi_scoring_model_path), map_location=device)
-    state: dict[str, torch.Tensor]
-    if isinstance(payload, dict) and "model_state" in payload:
-        state = payload["model_state"]
-    elif isinstance(payload, dict) and "state_dict" in payload:
-        state = payload["state_dict"]
-    else:
-        state = payload
-    model.load_state_dict(state)
-    model.to(device)
-    return model
+
+    def _load_one(path_s: str) -> RoiScoringNet:
+        model = RoiScoringNet(pretrained=False)
+        payload = _torch_load_compat(str(path_s), map_location=device)
+        state: dict[str, torch.Tensor]
+        if isinstance(payload, dict) and "model_state" in payload:
+            state = payload["model_state"]
+        elif isinstance(payload, dict) and "state_dict" in payload:
+            state = payload["state_dict"]
+        else:
+            state = payload
+        model.load_state_dict(state)
+        model.to(device)
+        return model
+
+    raw = str(config.roi_scoring_model_path).strip()
+    parts: list[str] = []
+    for chunk in raw.split(","):
+        for sub in chunk.split(";"):
+            p = sub.strip()
+            if p:
+                parts.append(p)
+
+    strategy = str(getattr(config, "roi_scoring_ensemble_strategy", "sum")).lower().strip()
+    if strategy not in {"sum", "mean"}:
+        raise ValueError("roi_scoring_ensemble_strategy must be one of: sum, mean")
+
+    if len(parts) <= 1:
+        return _load_one(parts[0])
+
+    class _RoiScoringEnsemble(RoiScoringNet):
+        """Ensemble wrapper that combines fold models via sum/mean of softmax probabilities."""
+
+        def __init__(self, models: list[RoiScoringNet], strategy: str) -> None:
+            super().__init__(pretrained=False)
+            self.models = nn.ModuleList(models)
+            self.strategy = str(strategy)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            probs_sum: torch.Tensor | None = None
+            for m in self.models:
+                logits = m(x)
+                probs = torch.softmax(logits, dim=1)
+                probs_sum = probs if probs_sum is None else (probs_sum + probs)
+            assert probs_sum is not None
+            if self.strategy == "mean":
+                probs_sum = probs_sum / float(len(self.models))
+            return probs_sum
+
+    models = [_load_one(p) for p in parts]
+    return _RoiScoringEnsemble(models=models, strategy=strategy)
 
 
 def _build_imagenet_transform(size: int) -> transforms.Compose:
