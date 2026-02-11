@@ -10,7 +10,7 @@ Example:
 from __future__ import annotations
 
 import argparse
-import csv
+import kycsv
 import json
 import logging
 import os
