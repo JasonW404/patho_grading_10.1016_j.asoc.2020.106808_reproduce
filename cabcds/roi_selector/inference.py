@@ -220,8 +220,12 @@ class RoiSelector:
                 step0,
             )
 
-            # Keep top-N using a min-heap: (score, candidate)
-            heap: list[tuple[float, RoiCandidate]] = []
+            # Keep top-N using min-heaps: (score, tie_breaker, candidate)
+            # - `heap`: candidates that pass the white/background filter (normal behavior)
+            # - `white_heap`: fallback candidates from "too-white" patches (only used if `heap` is empty)
+            heap: list[tuple[float, int, RoiCandidate]] = []
+            white_heap: list[tuple[float, int, RoiCandidate]] = []
+            tie_breaker = 0
 
             # Iterate in level-0 coordinates; convert to the chosen read_level implicitly via OpenSlide.
             total_rows = (y_end0 // step0) + 1
@@ -244,8 +248,7 @@ class RoiSelector:
                         continue
 
                     patch = np.asarray(region, dtype=np.uint8)
-                    if is_patch_too_white(patch, self.feature_config):
-                        continue
+                    too_white = is_patch_too_white(patch, self.feature_config)
 
                     if read_size != feature_size:
                         region_feat = region.resize((feature_size, feature_size), Image.Resampling.BILINEAR)
@@ -257,14 +260,23 @@ class RoiSelector:
                     score = float(self.model.decision_function(features.reshape(1, -1))[0])
                     candidate = RoiCandidate(x=int(x0), y=int(y0), score=score, patch=patch_feat)
 
-                    if len(heap) < top_n:
-                        heappush(heap, (score, candidate))
+                    tie_breaker += 1
+                    target_heap = white_heap if too_white else heap
+                    if len(target_heap) < top_n:
+                        heappush(target_heap, (score, tie_breaker, candidate))
                     else:
-                        if score > heap[0][0]:
-                            heappop(heap)
-                            heappush(heap, (score, candidate))
+                        if score > target_heap[0][0]:
+                            heappop(target_heap)
+                            heappush(target_heap, (score, tie_breaker, candidate))
 
-            selected = [c for _, c in sorted(heap, key=lambda t: t[0], reverse=True)]
+            selected = [c for _, _, c in sorted(heap, key=lambda t: t[0], reverse=True)]
+            if not selected and white_heap:
+                selected = [c for _, _, c in sorted(white_heap, key=lambda t: t[0], reverse=True)]
+                self.logger.warning(
+                    "WSI %s selected 0 ROIs after white-filter; falling back to top-%d white patches",
+                    image_path.name,
+                    len(selected),
+                )
 
             if selected:
                 self.logger.info(

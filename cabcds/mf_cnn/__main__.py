@@ -10,7 +10,8 @@ Example:
 from __future__ import annotations
 
 import argparse
-import kycsv
+import csv
+from datetime import datetime
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from cabcds.mf_cnn.utils.loader import (
     GlobalPatchIndexRow,
     build_default_mf_cnn_train_loaders,
     PreparedMitosisDetectionPatchDataset,
+    load_slide_labels_from_csv,
     load_tupac_train_scores,
     read_global_patch_index,
     read_det_patch_index,
@@ -2284,7 +2286,59 @@ def main() -> None:
     parser.add_argument(
         "--prepare-global",
         action="store_true",
-        help="Extract CNN_global training patches from TUPAC train WSIs and write an index CSV",
+        help="Extract CNN_global training patches from WSIs and write an index CSV",
+    )
+
+    parser.add_argument(
+        "--global-run-id",
+        type=str,
+        default=None,
+        help=(
+            "Run id used to build default output paths for --prepare-global under "
+            "output/mf_cnn/CNN_global/runs/<run_id>/global_patches/. "
+            "If omitted, a timestamped id is generated."
+        ),
+    )
+
+    parser.add_argument(
+        "--global-wsi-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional override WSI directory for --prepare-global. "
+            "Defaults to config.tupac_train_dir (dataset/tupac16/train)."
+        ),
+    )
+    parser.add_argument(
+        "--global-slide-glob",
+        type=str,
+        default=None,
+        help=(
+            "Optional glob to select slide files within --global-wsi-dir. "
+            "Defaults to 'TUPAC-TR-*.svs' when using the TUPAC train dir; otherwise '*.svs'."
+        ),
+    )
+    parser.add_argument(
+        "--global-labels-csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional slide-level labels CSV for --prepare-global. "
+            "If omitted, uses the TUPAC ground_truth.csv row-index mapping. "
+            "This repo also includes dataset/tupac16/train/ground_truth_with_groups.csv (header: group,label,score)."
+        ),
+    )
+    parser.add_argument(
+        "--global-label-id-col",
+        type=str,
+        default=None,
+        help="Optional column name in --global-labels-csv containing slide ids (auto-detected if omitted).",
+    )
+    parser.add_argument(
+        "--global-label-col",
+        type=str,
+        default=None,
+        help="Optional column name in --global-labels-csv containing integer class labels (auto-detected if omitted).",
     )
     
     parser.add_argument(
@@ -2669,6 +2723,18 @@ def main() -> None:
     parser.add_argument("--global-paper-epochs", type=int, default=30)
     parser.add_argument("--global-paper-split-seed", type=int, default=1337)
     parser.add_argument(
+        "--global-paper-holdout-train-slides",
+        type=int,
+        default=0,
+        help="If >0, sample this many slides (stratified) as the training/CV pool (e.g. 400)",
+    )
+    parser.add_argument(
+        "--global-paper-holdout-test-slides",
+        type=int,
+        default=0,
+        help="If >0, sample this many slides (stratified) as a held-out test set shared across folds (e.g. 100)",
+    )
+    parser.add_argument(
         "--global-paper-cv-folds",
         type=int,
         default=1,
@@ -2923,6 +2989,8 @@ def main() -> None:
             device=args.device,
             pretrained=bool(cfg.pretrained),
             split_seed=int(args.global_paper_split_seed),
+            holdout_train_slides=int(args.global_paper_holdout_train_slides),
+            holdout_test_slides=int(args.global_paper_holdout_test_slides),
             augment=not bool(args.no_global_augment),
             color_jitter=float(args.global_color_jitter),
             balance=not bool(args.no_global_balance),
@@ -3008,10 +3076,32 @@ def main() -> None:
 
     if args.prepare_global:
         cfg = load_mfc_cnn_config()
-        out_root = Path(args.out_root) if args.out_root else (cfg.output_dir / "global_patches")
-        index_csv = Path(args.index_csv) if args.index_csv else (cfg.output_dir / "global_patches" / "index.csv")
 
-        scores = load_tupac_train_scores(cfg.tupac_train_ground_truth_csv)
+        if args.out_root is not None or args.index_csv is not None:
+            out_root = Path(args.out_root) if args.out_root else (cfg.output_dir / "global_patches")
+            index_csv = Path(args.index_csv) if args.index_csv else (Path(out_root) / "index.csv")
+        else:
+            run_id = str(args.global_run_id) if args.global_run_id else datetime.now().strftime("%Y%m%d_%H%M_prepare_global")
+            run_dir = Path("output/mf_cnn/CNN_global/runs") / run_id
+            out_root = run_dir / "global_patches"
+            index_csv = out_root / "index.csv"
+
+        wsi_dir = Path(args.global_wsi_dir) if args.global_wsi_dir else Path(cfg.tupac_train_dir)
+        slide_glob = (
+            str(args.global_slide_glob)
+            if args.global_slide_glob
+            else ("TUPAC-TR-*.svs" if args.global_wsi_dir is None else "*.svs")
+        )
+
+        if args.global_labels_csv:
+            scores = load_slide_labels_from_csv(
+                Path(args.global_labels_csv),
+                id_column=(str(args.global_label_id_col) if args.global_label_id_col else None),
+                label_column=(str(args.global_label_col) if args.global_label_col else None),
+            )
+        else:
+            scores = load_tupac_train_scores(cfg.tupac_train_ground_truth_csv)
+
         roi_csv_dir = Path(args.roi_csv_dir) if args.roi_csv_dir else None
         roi_report_csv = Path(args.roi_report_csv) if args.roi_report_csv else None
         if roi_csv_dir is None and roi_report_csv is None:
@@ -3031,7 +3121,8 @@ def main() -> None:
                 max_by_score[3] = int(args.max_patches_score3)
 
         prepare_global_patch_dataset(
-            tupac_train_dir=cfg.tupac_train_dir,
+            wsi_dir=wsi_dir,
+            slide_glob=slide_glob,
             scores_by_slide_id=scores,
             out_root=out_root,
             index_csv=index_csv,
@@ -3475,6 +3566,8 @@ def _train_global_paper(
     device: str,
     pretrained: bool,
     split_seed: int,
+    holdout_train_slides: int,
+    holdout_test_slides: int,
     augment: bool,
     color_jitter: float,
     balance: bool,
@@ -3517,26 +3610,150 @@ def _train_global_paper(
 
     slide_ids = sorted(list(slide_to_label.keys()))
 
+    def _stratified_sample(
+        slides_by_label: dict[int, list[str]],
+        *,
+        n_total: int,
+        rng: random.Random,
+    ) -> set[str]:
+        if int(n_total) <= 0:
+            return set()
+        total = sum(len(v) for v in slides_by_label.values())
+        if int(n_total) > int(total):
+            raise ValueError(f"Requested {n_total} slides but only {total} available")
+
+        # Allocate per label proportional to group sizes.
+        desired: dict[int, float] = {}
+        base: dict[int, int] = {}
+        frac: list[tuple[float, int]] = []
+        for lbl, group in slides_by_label.items():
+            if not group:
+                continue
+            d = float(n_total) * (float(len(group)) / float(total))
+            k = int(d)
+            k = min(k, len(group))
+            desired[lbl] = d
+            base[lbl] = k
+            frac.append((float(d - float(k)), int(lbl)))
+
+        remaining = int(n_total) - sum(int(v) for v in base.values())
+        for _, lbl in sorted(frac, key=lambda t: t[0], reverse=True):
+            if remaining <= 0:
+                break
+            cap = len(slides_by_label.get(int(lbl), []))
+            if int(base.get(int(lbl), 0)) < int(cap):
+                base[int(lbl)] = int(base.get(int(lbl), 0)) + 1
+                remaining -= 1
+
+        # If rounding/caps prevented us from reaching n_total, distribute to any label with remaining capacity.
+        if remaining > 0:
+            labels = sorted(slides_by_label.keys(), key=lambda l: len(slides_by_label[l]), reverse=True)
+            while remaining > 0:
+                progressed = False
+                for lbl in labels:
+                    cap = len(slides_by_label.get(int(lbl), []))
+                    if int(base.get(int(lbl), 0)) < int(cap):
+                        base[int(lbl)] = int(base.get(int(lbl), 0)) + 1
+                        remaining -= 1
+                        progressed = True
+                        if remaining <= 0:
+                            break
+                if not progressed:
+                    break
+        if remaining != 0:
+            raise RuntimeError("Failed to allocate stratified sample counts")
+
+        picked: set[str] = set()
+        for lbl, group in slides_by_label.items():
+            group_copy = list(group)
+            rng.shuffle(group_copy)
+            k = int(base.get(int(lbl), 0))
+            picked.update(group_copy[:k])
+
+        if len(picked) != int(n_total):
+            # Fallback: trim or fill from remaining slides (still deterministic).
+            all_slides = [s for g in slides_by_label.values() for s in g]
+            all_slides = sorted(set(all_slides))
+            rng.shuffle(all_slides)
+            picked = set(list(picked)[: int(n_total)])
+            if len(picked) < int(n_total):
+                for s in all_slides:
+                    if s in picked:
+                        continue
+                    picked.add(s)
+                    if len(picked) == int(n_total):
+                        break
+        if len(picked) != int(n_total):
+            raise RuntimeError(f"Stratified sampling failed: got {len(picked)} != {n_total}")
+        return picked
+
+    holdout_train_slides_i = max(0, int(holdout_train_slides))
+    holdout_test_slides_i = max(0, int(holdout_test_slides))
+
+    # Optional: reserve a fixed held-out test set, then run CV on a training pool.
+    heldout_test: set[str] = set()
+    cv_pool: set[str] = set(slide_ids)
+    if holdout_test_slides_i > 0 or holdout_train_slides_i > 0:
+        by_label_all: dict[int, list[str]] = {}
+        for sid, lbl in slide_to_label.items():
+            by_label_all.setdefault(int(lbl), []).append(str(sid))
+
+        rng = random.Random(int(split_seed))
+        for group in by_label_all.values():
+            rng.shuffle(group)
+
+        if holdout_test_slides_i > 0:
+            heldout_test = _stratified_sample(by_label_all, n_total=int(holdout_test_slides_i), rng=rng)
+            for lbl in list(by_label_all.keys()):
+                by_label_all[lbl] = [s for s in by_label_all[lbl] if s not in heldout_test]
+
+        remaining_after_test = set(s for g in by_label_all.values() for s in g)
+        if holdout_train_slides_i > 0:
+            cv_pool = _stratified_sample(by_label_all, n_total=int(holdout_train_slides_i), rng=rng)
+        else:
+            cv_pool = set(remaining_after_test)
+
+        if heldout_test:
+            logger.info(
+                "Global holdout split (slides): total=%d cv_pool=%d test=%d (seed=%d)",
+                len(slide_ids),
+                len(cv_pool),
+                len(heldout_test),
+                int(split_seed),
+            )
+
     if cv_folds_i == 1:
         _append_metrics_row(metrics_csv, {"event": "start", "device": str(device), "cv_folds": 1})
 
         by_label: dict[int, list[str]] = {}
-        for sid, lbl in slide_to_label.items():
-            by_label.setdefault(int(lbl), []).append(sid)
+        pool = sorted(list(cv_pool)) if (holdout_test_slides_i > 0 or holdout_train_slides_i > 0) else slide_ids
+        for sid in pool:
+            by_label.setdefault(int(slide_to_label[str(sid)]), []).append(str(sid))
 
         rng = random.Random(int(split_seed))
         train_slides: set[str] = set()
         val_slides: set[str] = set()
-        test_slides: set[str] = set()
+        test_slides: set[str] = set(heldout_test)
 
         for group in by_label.values():
             rng.shuffle(group)
             n = len(group)
-            n_train = int(0.6 * n)
-            n_val = int(0.2 * n)
+            n_train = int(0.8 * n)
+            n_val = n - n_train
             train_slides.update(group[:n_train])
-            val_slides.update(group[n_train : n_train + n_val])
-            test_slides.update(group[n_train + n_val :])
+            val_slides.update(group[n_train:])
+        if not test_slides:
+            # Backwards-compatible 60/20/20 when no explicit holdout requested.
+            train_slides.clear()
+            val_slides.clear()
+            for group in by_label.values():
+                rng.shuffle(group)
+                n = len(group)
+                n_train = int(0.6 * n)
+                n_val = int(0.2 * n)
+                train_slides.update(group[:n_train])
+                val_slides.update(group[n_train : n_train + n_val])
+                test_slides.update(group[n_train + n_val :])
 
         train_rows = [r for r in rows if r.slide_id in train_slides]
         val_rows = [r for r in rows if r.slide_id in val_slides]
@@ -3584,15 +3801,22 @@ def _train_global_paper(
             split_payload={
                 "cv_folds": 1,
                 "split_seed": int(split_seed),
-                "split": {"train": 0.6, "val": 0.2, "test": 0.2},
+                "split": {"train": "holdout" if bool(heldout_test) else 0.6, "val": "holdout" if bool(heldout_test) else 0.2, "test": "holdout" if bool(heldout_test) else 0.2},
+                "holdout": {
+                    "train_slides": int(holdout_train_slides_i),
+                    "test_slides": int(holdout_test_slides_i),
+                },
             },
         )
         return
 
     # --- K-fold CV (paper-style) ---
+    cv_slide_ids = sorted(list(cv_pool))
+
     by_label: dict[int, list[str]] = {}
-    for sid, lbl in slide_to_label.items():
-        by_label.setdefault(int(lbl), []).append(sid)
+    for sid in cv_slide_ids:
+        by_label.setdefault(int(slide_to_label[str(sid)]), []).append(str(sid))
+
     rng = random.Random(int(split_seed))
     for group in by_label.values():
         rng.shuffle(group)
@@ -3600,9 +3824,9 @@ def _train_global_paper(
     folds: list[set[str]] = [set() for _ in range(cv_folds_i)]
     for _, group in by_label.items():
         for i, sid in enumerate(group):
-            folds[i % cv_folds_i].add(sid)
+            folds[i % cv_folds_i].add(str(sid))
 
-    all_slides = set(slide_ids)
+    all_slides = set(cv_slide_ids)
     fold_ckpts: list[str] = []
     fold_metrics: list[str] = []
 
@@ -3620,8 +3844,11 @@ def _train_global_paper(
 
         train_rows = [r for r in rows if r.slide_id in train_slides]
         val_rows = [r for r in rows if r.slide_id in val_slides]
-        # CV: no separate test; we mirror val into test to keep logging schema stable.
-        test_rows = val_rows
+        if heldout_test:
+            test_rows = [r for r in rows if r.slide_id in heldout_test]
+        else:
+            # Backwards-compatible CV mode: no separate test; mirror val to keep schema stable.
+            test_rows = val_rows
 
         fold_checkpoint = checkpoint_path.with_name(
             f"{checkpoint_path.stem}_fold{fold_idx + 1}{checkpoint_path.suffix}"
@@ -3651,7 +3878,7 @@ def _train_global_paper(
                 "fold": int(fold_idx + 1),
                 "train_slide_ids": sorted(list(train_slides)),
                 "val_slide_ids": sorted(list(val_slides)),
-                "test_slide_ids": sorted(list(val_slides)),
+                "test_slide_ids": sorted(list(heldout_test)) if heldout_test else sorted(list(val_slides)),
                 "checkpoint_path": str(fold_checkpoint),
                 "metrics_csv": str(fold_metrics_csv),
                 "split_payload": {
@@ -3659,6 +3886,10 @@ def _train_global_paper(
                     "fold": int(fold_idx + 1),
                     "split_seed": int(split_seed),
                     "val_slides": sorted(list(val_slides)),
+                    "holdout": {
+                        "train_slides": int(holdout_train_slides_i),
+                        "test_slides": int(holdout_test_slides_i),
+                    },
                 },
             }
         )

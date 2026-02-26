@@ -34,6 +34,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from cabcds.hybrid_descriptor.descriptor import HYBRID_DESCRIPTOR_FEATURE_NAMES
+from cabcds.wsi_scorer.feature_transform import FeatureAblationTransformer
 
 
 LOGGER = logging.getLogger("train_wsi_scorer")
@@ -122,6 +123,24 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--ablate-mitosis-features",
+        action="store_true",
+        help=(
+            "Ablation: drop feature columns 6..14 (1-based) and keep only 1..5 and 15. "
+            "This targets mitosis-related features that may be contaminated upstream."
+        ),
+    )
+    parser.add_argument(
+        "--weaken-mitosis-factor",
+        type=float,
+        default=None,
+        help=(
+            "Ablation: multiply feature columns 6..14 (1-based) by this factor (e.g. 0.1). "
+            "Cannot be combined with --ablate-mitosis-features."
+        ),
+    )
+
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -129,6 +148,7 @@ def _parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
 
 
 def _resolve_outputs(out_dir: Path) -> TrainOutputs:
@@ -261,25 +281,50 @@ class ModelSpec:
     seed: int
 
 
-def _build_model(spec: ModelSpec) -> Pipeline:
+class FeatureTransformPosition(str):
+    BEFORE_SCALER = "before_scaler"
+    AFTER_SCALER = "after_scaler"
+
+
+def _build_model(
+    spec: ModelSpec,
+    feature_transform: FeatureAblationTransformer | None,
+    transform_position: str,
+) -> Pipeline:
+    """Build a model Pipeline.
+
+    Notes:
+        - Dropping/selecting columns must happen before StandardScaler.
+        - Weakening (multiplying) selected columns should happen after
+          StandardScaler; otherwise z-score normalization cancels the effect.
+    """
+
     class_weight = None if spec.class_weight == "none" else "balanced"
 
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "svm",
-                SVC(
-                    C=float(spec.svm_c),
-                    kernel=str(spec.svm_kernel),
-                    decision_function_shape=str(spec.decision_function_shape),
-                    class_weight=class_weight,
-                    probability=bool(spec.probability),
-                    random_state=int(spec.seed),
-                ),
+    steps: list[tuple[str, object]] = []
+    if feature_transform is not None and transform_position == FeatureTransformPosition.BEFORE_SCALER:
+        steps.append(("features", feature_transform))
+
+    steps.append(("scaler", StandardScaler()))
+
+    if feature_transform is not None and transform_position == FeatureTransformPosition.AFTER_SCALER:
+        steps.append(("features", feature_transform))
+
+    steps.append(
+        (
+            "svm",
+            SVC(
+                C=float(spec.svm_c),
+                kernel=str(spec.svm_kernel),
+                decision_function_shape=str(spec.decision_function_shape),
+                class_weight=class_weight,
+                probability=bool(spec.probability),
+                random_state=int(spec.seed),
             ),
-        ]
+        )
     )
+
+    return Pipeline(steps)
 
 
 def _default_spec(args: argparse.Namespace) -> ModelSpec:
@@ -310,6 +355,8 @@ def _evaluate_cv(
     y_all: np.ndarray,
     cv: StratifiedKFold,
     spec: ModelSpec,
+    feature_transform: FeatureAblationTransformer | None,
+    transform_position: str,
     report_confusion: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     fold_rows: list[dict[str, Any]] = []
@@ -324,7 +371,11 @@ def _evaluate_cv(
         x_train, x_val = x_all[train_idx], x_all[val_idx]
         y_train, y_val = y_all[train_idx], y_all[val_idx]
 
-        fold_model = _build_model(spec)
+        fold_model = _build_model(
+            spec,
+            feature_transform=feature_transform,
+            transform_position=str(transform_position),
+        )
         fold_model.fit(x_train, y_train)
 
         y_pred = fold_model.predict(x_val)
@@ -373,7 +424,8 @@ def _select_best_spec(
     base_spec: ModelSpec,
     c_grid: list[float],
     grid_class_weight: str,
-    report_confusion: bool,
+    feature_transform: FeatureAblationTransformer | None,
+    transform_position: str,
 ) -> tuple[ModelSpec, dict[str, Any]]:
     if grid_class_weight == "both":
         class_weights = ["none", "balanced"]
@@ -394,7 +446,15 @@ def _select_best_spec(
                 seed=base_spec.seed,
             )
 
-            _, summary = _evaluate_cv(x_all, y_all, cv, spec, report_confusion=False)
+            _, summary = _evaluate_cv(
+                x_all,
+                y_all,
+                cv,
+                spec,
+                feature_transform=feature_transform,
+                transform_position=str(transform_position),
+                report_confusion=False,
+            )
             LOGGER.info(
                 "Grid candidate C=%s class_weight=%s -> kappa=%.4f acc=%.4f",
                 str(spec.svm_c),
@@ -442,6 +502,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     args = _parse_args()
 
+    if bool(args.ablate_mitosis_features) and args.weaken_mitosis_factor is not None:
+        raise ValueError("Cannot combine --ablate-mitosis-features with --weaken-mitosis-factor")
+
     features_csv = Path(args.features_csv)
     labels_csv = Path(args.labels_csv)
     outputs = _resolve_outputs(Path(args.out_dir))
@@ -460,6 +523,43 @@ def main() -> None:
 
     unique, counts = np.unique(y_all, return_counts=True)
     class_distribution = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist(), strict=False)}
+
+    n_features_in = int(x_all.shape[1])
+    if n_features_in < 15:
+        LOGGER.warning(
+            "Expected 15-D hybrid descriptors, but got n_features=%d. Ablation indices assume 15-D.",
+            n_features_in,
+        )
+
+    # A small, explicit ablation hook to mitigate potentially contaminated mitosis-related features.
+    # Columns are 1-based in user-facing docs; convert to 0-based here.
+    keep_indices: list[int] | None = None
+    scale_indices: list[int] | None = None
+    scale_factor = 1.0
+    if bool(args.ablate_mitosis_features):
+        # Keep only columns 1..5 and 15.
+        keep_indices = [0, 1, 2, 3, 4, 14]
+    elif args.weaken_mitosis_factor is not None:
+        scale_factor = float(args.weaken_mitosis_factor)
+        # Weaken columns 6..14.
+        scale_indices = list(range(5, 14))
+
+    feature_transform: FeatureAblationTransformer | None = None
+    transform_position = FeatureTransformPosition.BEFORE_SCALER
+    if keep_indices is not None:
+        feature_transform = FeatureAblationTransformer(
+            keep_indices=keep_indices,
+            scale_indices=None,
+            scale_factor=1.0,
+        )
+        transform_position = FeatureTransformPosition.BEFORE_SCALER
+    elif scale_indices is not None:
+        feature_transform = FeatureAblationTransformer(
+            keep_indices=None,
+            scale_indices=scale_indices,
+            scale_factor=scale_factor,
+        )
+        transform_position = FeatureTransformPosition.AFTER_SCALER
 
     LOGGER.info("Joined dataset rows: %d", x_all.shape[0])
     LOGGER.info("Class distribution: %s", str(class_distribution))
@@ -499,7 +599,8 @@ def main() -> None:
             base_spec,
             c_grid=c_grid,
             grid_class_weight=grid_cw,
-            report_confusion=False,
+            feature_transform=feature_transform,
+            transform_position=str(transform_position),
         )
         LOGGER.info(
             "Selected best spec: C=%s class_weight=%s (mean kappa=%.4f, mean acc=%.4f)",
@@ -514,6 +615,8 @@ def main() -> None:
         y_all,
         cv,
         selected_spec,
+        feature_transform=feature_transform,
+        transform_position=str(transform_position),
         report_confusion=bool(args.report_confusion),
     )
 
@@ -527,7 +630,11 @@ def main() -> None:
     _write_cv_report(outputs.cv_report_path, fold_rows)
     LOGGER.info("Wrote CV report: %s", str(outputs.cv_report_path))
 
-    model = _build_model(selected_spec)
+    model = _build_model(
+        selected_spec,
+        feature_transform=feature_transform,
+        transform_position=str(transform_position),
+    )
     model.fit(x_all, y_all)
 
     payload = {
@@ -542,6 +649,14 @@ def main() -> None:
             "class_weight": selected_spec.class_weight,
             "probability": selected_spec.probability,
             "seed": selected_spec.seed,
+        },
+        "feature_ablation": {
+            "ablate_mitosis_features": bool(args.ablate_mitosis_features),
+            "weaken_mitosis_factor": args.weaken_mitosis_factor,
+            "keep_indices_0based": keep_indices,
+            "scale_indices_0based": scale_indices,
+            "scale_factor": float(scale_factor),
+            "transform_position": str(transform_position),
         },
         "join_summary": join_summary,
         "class_distribution": class_distribution,
@@ -566,6 +681,7 @@ def main() -> None:
         "inputs": {"features_csv": str(features_csv), "labels_csv": str(labels_csv)},
         "args": vars(args),
         "selected_spec": payload["selected_spec"],
+        "feature_ablation": payload["feature_ablation"],
         "join_summary": join_summary,
         "class_distribution": class_distribution,
         "cv": payload["cv"],

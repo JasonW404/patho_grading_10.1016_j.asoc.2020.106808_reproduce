@@ -61,8 +61,23 @@ class GlobalPatchRecord:
 def iter_tupac_train_slides(tupac_train_dir: Path) -> Iterator[Path]:
     """Yield `.svs` slide paths in sorted order."""
 
-    for slide in sorted(Path(tupac_train_dir).glob("TUPAC-TR-*.svs")):
-        yield slide
+    yield from iter_wsi_slides(Path(tupac_train_dir), slide_glob="TUPAC-TR-*.svs")
+
+
+def iter_wsi_slides(wsi_dir: Path, *, slide_glob: str = "*.svs") -> Iterator[Path]:
+    """Yield WSI slide paths in sorted order.
+
+    Args:
+        wsi_dir: Directory containing slide files.
+        slide_glob: Glob pattern used to select slides (e.g. `*.svs`).
+
+    Yields:
+        Slide file paths in lexicographic order.
+    """
+
+    for slide in sorted(Path(wsi_dir).glob(str(slide_glob))):
+        if slide.is_file():
+            yield slide
 
 
 def compute_simple_tissue_fraction(rgb: np.ndarray) -> float:
@@ -533,7 +548,9 @@ def slide_done_marker(out_root: Path, slide_id: str) -> Path:
 
 def prepare_global_patch_dataset(
     *,
-    tupac_train_dir: Path,
+    wsi_dir: Path | None = None,
+    slide_glob: str = "TUPAC-TR-*.svs",
+    tupac_train_dir: Path | None = None,
     scores_by_slide_id: dict[str, int],
     out_root: Path,
     index_csv: Path,
@@ -559,7 +576,9 @@ def prepare_global_patch_dataset(
     if `index_csv` already contains a slide_id, that slide is skipped.
 
     Args:
-        tupac_train_dir: Directory containing `TUPAC-TR-*.svs` files.
+        wsi_dir: Directory containing WSI slides.
+        slide_glob: Glob pattern selecting slide files within `wsi_dir`.
+        tupac_train_dir: Deprecated alias for `wsi_dir` kept for backward compatibility.
         scores_by_slide_id: Mapping `TUPAC-TR-xxx -> score` (1..3).
         out_root: Root directory where per-slide patch folders are created.
         index_csv: Output index CSV (appended incrementally).
@@ -589,10 +608,16 @@ def prepare_global_patch_dataset(
     index_csv = Path(index_csv)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    resolved_wsi_dir = Path(wsi_dir) if wsi_dir is not None else None
+    if resolved_wsi_dir is None and tupac_train_dir is not None:
+        resolved_wsi_dir = Path(tupac_train_dir)
+    if resolved_wsi_dir is None:
+        raise ValueError("Must provide wsi_dir (or deprecated tupac_train_dir)")
+
     existing_paths = read_indexed_paths(index_csv) if resume else set()
     processed = 0
 
-    for slide_path in iter_tupac_train_slides(Path(tupac_train_dir)):
+    for slide_path in iter_wsi_slides(resolved_wsi_dir, slide_glob=str(slide_glob)):
         slide_id = slide_path.stem
         if resume and slide_done_marker(out_root, slide_id).exists():
             continue

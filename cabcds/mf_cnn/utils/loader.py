@@ -792,6 +792,104 @@ def load_tupac_train_scores(ground_truth_csv: Path) -> dict[str, int]:
 	return scores
 
 
+def load_slide_labels_from_csv(
+	labels_csv: Path,
+	*,
+	id_column: str | None = None,
+	label_column: str | None = None,
+) -> dict[str, int]:
+	"""Load slide-level labels from a CSV.
+
+	This is intended to support user-provided metadata files in addition to the
+	TUPAC `ground_truth.csv` row-index mapping.
+
+	Supported formats:
+	- Header CSV with columns that identify the slide and label.
+	  Auto-detects common column names.
+	  Example in this repo: `dataset/tupac16/train/ground_truth_with_groups.csv`
+	  with header `group,label,score` where `group` is the slide id.
+	- No-header CSV with two columns: `slide_id,label`.
+
+	Args:
+		labels_csv: CSV path.
+		id_column: Optional explicit column name containing slide identifiers.
+		label_column: Optional explicit column name containing class labels.
+
+	Returns:
+		Mapping from slide_id (usually slide stem) to integer label.
+	"""
+
+	labels_csv = Path(labels_csv)
+	if not labels_csv.exists():
+		raise FileNotFoundError(str(labels_csv))
+
+	content = labels_csv.read_text(encoding="utf-8", errors="replace").strip()
+	if not content:
+		return {}
+
+	# First try header-based parsing.
+	with labels_csv.open("r", newline="", encoding="utf-8") as f:
+		sample = f.read(4096)
+		has_header = any(h in sample.lower() for h in ["slide", "group", "label", "score", "path", "id"]) and ("\n" in sample)
+
+	if has_header:
+		with labels_csv.open("r", newline="", encoding="utf-8") as f:
+			reader = csv.DictReader(f)
+			fieldnames = [str(x).strip() for x in (reader.fieldnames or [])]
+			if not fieldnames:
+				has_header = False
+			else:
+				id_candidates = [
+					"slide_id",
+					"group",
+					"id",
+					"slide",
+					"wsi",
+					"filename",
+					"image",
+					"path",
+				]
+				label_candidates = ["label", "score", "class", "target", "y"]
+
+				resolved_id_col = id_column if id_column is not None else next((c for c in id_candidates if c in fieldnames), None)
+				resolved_label_col = (
+					label_column if label_column is not None else next((c for c in label_candidates if c in fieldnames), None)
+				)
+				if resolved_id_col is None or resolved_label_col is None:
+					raise ValueError(
+						"Could not infer id/label columns from labels CSV. "
+						"Provide --global-label-id-col/--global-label-col (CLI) or pass id_column/label_column. "
+						f"Available columns: {fieldnames}"
+					)
+
+				labels: dict[str, int] = {}
+				for row in reader:
+					raw_id = str(row.get(resolved_id_col) or "").strip()
+					raw_label = str(row.get(resolved_label_col) or "").strip()
+					if not raw_id or not raw_label:
+						continue
+					if resolved_id_col == "path":
+						slide_id = Path(raw_id).stem
+					else:
+						slide_id = raw_id
+					labels[slide_id] = int(float(raw_label))
+				return labels
+
+	# Fallback: simple two-column CSV without header.
+	labels: dict[str, int] = {}
+	with labels_csv.open("r", encoding="utf-8") as f:
+		for line in f:
+			line = line.strip()
+			if not line:
+				continue
+			parts = [p.strip() for p in line.split(",") if p.strip()]
+			if len(parts) < 2:
+				continue
+			slide_id = parts[0]
+			labels[slide_id] = int(float(parts[1]))
+	return labels
+
+
 def build_default_mf_cnn_train_loaders(
 	config: MfcCnnConfig,
 	*,
