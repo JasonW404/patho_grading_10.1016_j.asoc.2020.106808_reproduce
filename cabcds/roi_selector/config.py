@@ -283,4 +283,30 @@ def load_roi_selector_config() -> ROISelectorConfig:
         if updates:
              config = config.model_copy(update=updates)
 
+    # Auto-detect alternate dataset layouts.
+    # New layout (this repo commonly uses):
+    #   dataset/tupac16/{train,test,auxiliary_dataset_roi,auxiliary_dataset_mitoses}
+    # Old layout:
+    #   dataset/{train,test,auxiliary_dataset_roi,auxiliary_dataset_mitoses}
+    #
+    # We only override when the configured path does not exist, so explicit env
+    # overrides (CABCDS_ROI_*) still take priority.
+    base = Path("dataset")
+    tupac16_root = base / "tupac16"
+    if tupac16_root.exists() and tupac16_root.is_dir():
+        candidate_train = tupac16_root / "train"
+        candidate_test = tupac16_root / "test"
+        candidate_roi = tupac16_root / "auxiliary_dataset_roi"
+
+        overrides: dict[str, object] = {}
+        if not config.preproc_dataset_dir.exists() and candidate_train.exists():
+            overrides["preproc_dataset_dir"] = candidate_train
+        if not config.infer_wsi_dir.exists() and candidate_test.exists():
+            overrides["infer_wsi_dir"] = candidate_test
+        if not config.roi_csv_dir.exists() and candidate_roi.exists():
+            overrides["roi_csv_dir"] = candidate_roi
+
+        if overrides:
+            config = config.model_copy(update=overrides)
+
     return config

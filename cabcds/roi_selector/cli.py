@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""
-Main entry point for ROI Selector pipeline.
-Supports data preparation and training via command line arguments.
+"""CLI entry point for ROI Selector pipeline.
+
+Run via:
+
+    uv run python -m cabcds.roi_selector --help
 """
 
 import argparse
@@ -9,36 +11,36 @@ import logging
 import sys
 from pathlib import Path
 
+from cabcds.roi_selector.benchmark import create_benchmark, prune_benchmark_sources
 from cabcds.roi_selector.config import load_roi_selector_config
+from cabcds.roi_selector.negative_filter_dl import train_negative_filter_dl
+from cabcds.roi_selector.training import RoiSelectorTrainer
 from cabcds.roi_selector.utils.create_roi_patches import (
-    create_positive_roi,
     create_negative_roi,
+    create_positive_roi,
     generate_labelled_csv,
 )
-from cabcds.roi_selector.negative_filter_dl import train_negative_filter_dl
-from cabcds.roi_selector.benchmark import create_benchmark, prune_benchmark_sources
-from cabcds.roi_selector.training import RoiSelectorTrainer
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="ROI Selector Pipeline Management",
         allow_abbrev=False,
     )
     parser.add_argument(
-        "--prepare", 
-        action="store_true", 
-        help="Run data preparation: generate positive and negative patches from WSIs."
+        "--prepare",
+        action="store_true",
+        help="Run data preparation: generate positive and negative patches from WSIs.",
     )
     parser.add_argument(
-        "--prepare-positive", 
-        action="store_true", 
-        help="Run data preparation: generate only positive patches."
+        "--prepare-positive",
+        action="store_true",
+        help="Run data preparation: generate only positive patches.",
     )
     parser.add_argument(
-        "--prepare-negative", 
-        action="store_true", 
-        help="Run data preparation: generate only negative patches."
+        "--prepare-negative",
+        action="store_true",
+        help="Run data preparation: generate only negative patches.",
     )
     parser.add_argument(
         "--neg-total-target-count",
@@ -70,9 +72,9 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--train", 
-        action="store_true", 
-        help="Run SVM training using generated patches."
+        "--train",
+        action="store_true",
+        help="Run SVM training using generated patches.",
     )
 
     parser.add_argument(
@@ -114,23 +116,21 @@ def main() -> None:
             "This ensures holdout patches cannot be used for training."
         ),
     )
-    
-    args = parser.parse_args()
 
-    # Configure logging
+    args = parser.parse_args(args=argv)
+
     logging.basicConfig(
-        level=logging.INFO, 
+        level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logger = logging.getLogger("roi_selector_main")
+    logger = logging.getLogger("roi_selector")
 
-    # Load configuration
     try:
         config = load_roi_selector_config()
         logger.info("Configuration loaded successfully.")
-    except Exception as e:
-        logger.error(f"Failed to load configuration: {e}")
+    except Exception as exc:
+        logger.error("Failed to load configuration: %s", exc)
         sys.exit(1)
 
     if args.use_negative_filter_dl:
@@ -161,47 +161,40 @@ def main() -> None:
         moved, removed_rows = prune_benchmark_sources(config, move=True)
         logger.info("Pruned benchmark sources: moved=%d removed_rows=%d", moved, removed_rows)
 
-    ran_aux_action = bool(
-        args.train_negative_filter_dl
-        or args.create_benchmark
-        or args.prune_benchmark_sources
-    )
+    ran_aux_action = bool(args.train_negative_filter_dl or args.create_benchmark or args.prune_benchmark_sources)
     ran_pipeline_action = bool(args.prepare or args.prepare_positive or args.prepare_negative or args.train)
     if ran_aux_action and not ran_pipeline_action:
         return
 
-    # 1. Data Preparation
     run_positive = args.prepare or args.prepare_positive
     run_negative = args.prepare or args.prepare_negative
-    
+
     if run_positive or run_negative:
         logger.info("=== Starting Data Preparation Phase ===")
         try:
             if run_positive:
                 logger.info("Generating Positive ROIs...")
                 create_positive_roi(config)
-            
+
             if run_negative:
                 logger.info("Generating Negative ROIs...")
                 create_negative_roi(config)
-            
+
             logger.info("Generating Labelled CSV Index...")
             csv_path = generate_labelled_csv(config)
-            logger.info(f"Data preparation completed. Index file: {csv_path}")
-            
-        except Exception as e:
-            logger.error(f"Data preparation failed: {e}", exc_info=True)
+            logger.info("Data preparation completed. Index file: %s", csv_path)
+        except Exception as exc:
+            logger.error("Data preparation failed: %s", exc, exc_info=True)
             sys.exit(1)
 
-    # 2. Training
     if args.train:
         logger.info("=== Starting Training Phase ===")
         try:
             trainer = RoiSelectorTrainer(config)
             trainer.train()
             logger.info("Training completed successfully.")
-        except Exception as e:
-            logger.error(f"Training failed: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Training failed: %s", exc, exc_info=True)
             sys.exit(1)
 
     if not ran_pipeline_action and not ran_aux_action:

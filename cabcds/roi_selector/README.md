@@ -26,7 +26,7 @@ The ROI Selector module identifies and extracts candidate Regions of Interest (R
 
 **Quick usage**
 
-- Prepare training patches: `uv run python roi_selector.py --prepare`
-- Train SVM: `uv run python roi_selector.py --train`
+- Prepare training patches: `uv run python -m cabcds.roi_selector --prepare`
+- Train SVM: `uv run python -m cabcds.roi_selector --train`
 - Run inference: `uv run python main.py`
 

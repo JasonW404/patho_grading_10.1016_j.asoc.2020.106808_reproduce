@@ -1,227 +1,272 @@
-# Pathology grading reproduction (CABCDS)
+# Multifaceted fused-CNN 乳腺癌 WSI 评分复现（CABCDS, 交接版）
 
-This repository reproduces parts of the pipeline described in:
+## 1. 项目简介 (Introduction)
 
-- *Automated grading of breast cancer histopathology images using mitosis detection and whole-slide image features* (ASOC 2020, 10.1016/j.asoc.2020.106808)
+本项目复现了医疗 AI 论文《Multifaceted fused-CNN based scoring of breast cancer whole-slide histopathology images》（原论文无开源代码），并针对工程落地场景（极端类别不平衡、防数据泄漏、可复现训练/推理流水线等）进行了系统化改造与实现。最终在目标评估设置下达到 **Quadratic Weighted Kappa = 0.15**。
 
-The most actively maintained component in this repo is the **ROI selector** (traditional ML) that scans WSI images and extracts the top-$k$ candidate Regions of Interest (ROIs) for downstream scoring.
+## 2. 环境与依赖 (Requirements)
 
-## Setup
+本项目使用 `uv` 管理依赖，建议统一用 `uv run ...` 执行命令。
 
-This project uses `uv`.
+- OS：Linux（推荐 Ubuntu 22.04）
+- Python：`<填写你的 Python 版本>`
+- PyTorch：`<填写你的 PyTorch 版本>`
+- GPU/NPU：可选
+	- NVIDIA：CUDA 版本 `<填写>`
+	- Ascend：`torch_npu`（如使用 NPU 推理/训练）
+- 关键系统依赖
+	- OpenSlide（读取 `.svs` WSI）：需安装系统库与 Python 包（确保 `openslide` 可 import）
 
-- Create/sync environment: `uv sync`
-- Run commands: prefix with `uv run ...`
+快速检查：
 
-Example:
+```bash
+uv sync
+uv run python -m cabcds.roi_selector --help
+uv run python -m cabcds.mf_cnn --help
+uv run python -m cabcds.wsi_scorer --help
+```
 
-- `uv run python roi_selector.py --help`
+## 3. 数据准备 (Data Preparation)
 
-## Data layout
+### 3.1 TUPAC16 数据集目录约定
 
-By default, paths are configured via `pydantic-settings` in [cabcds/roi_selector/config.py](cabcds/roi_selector/config.py).
+将 TUPAC16（WSI）和辅助标注数据按如下结构放置：
 
-Expected directories (defaults):
+```text
+dataset/
+	tupac16/
+		train/                          # 训练集 WSI（.svs）
+		test/                           # 测试集 WSI（.svs）
+		auxiliary_dataset_roi/          # ROI 标注（每个 WSI 一个 *-ROI.csv）
+		auxiliary_dataset_mitoses/      # 有丝分裂辅助数据（zips / CSV GT 等，供 CNN_seg/CNN_det 使用）
+	mitos14/                         # 可选：外部 mitosis 数据集（若启用 CNN_seg paper 配方）
+		train/
+		test/
+```
 
-- Training WSIs: `dataset/train`
-- Test WSIs: `dataset/test`
-- ROI CSV annotations: `dataset/auxiliary_dataset_roi`
+说明：
 
-Generated outputs (ignored by git):
+- ROI CSV 文件命名要求：`<WSI_ID>-ROI.csv`（例如 `TUPAC-TR-001-ROI.csv`）。
+- 产物目录默认写到 `output/`（被 `.gitignore` 忽略，适合大文件训练/推理产物）。
 
-- Training patches: `output/roi_selector/training/{positive,negative,negative_generated}`
-- Trained models: `output/roi_selector/models/`
-- Inference outputs: `output/roi_selector/outputs/`
-- Benchmark/holdout: `output/roi_selector/benchmark/`
+### 3.2 运行 ROI-Selector 生成训练数据/推理补丁
 
-The repo `.gitignore` excludes `dataset/` and `output/`.
+ROI-Selector（Stage 1）负责从 WSI 中抽取候选 ROI patch，供后续 CNN_global 与 Hybrid-Descriptor 使用。
 
-### Configuration overrides
+```bash
+# 生成正/负 patch（训练用）并更新索引 CSV
+uv run python -m cabcds.roi_selector --prepare
 
-All ROI selector settings can be overridden via environment variables prefixed with `CABCDS_ROI_`.
+# 仅生成正样本
+uv run python -m cabcds.roi_selector --prepare-positive
 
-Example (change negative target count):
+# 仅生成负样本（含可选的负样本过滤）
+uv run python -m cabcds.roi_selector --prepare-negative
+```
 
-- `CABCDS_ROI_NEG_TOTAL_TARGET_COUNT=2000 uv run python roi_selector.py --prepare-negative`
+推理（全片扫描 + top-k ROI 输出）走项目入口：
 
-Nested fields use `__` as delimiter.
+```bash
+uv run python main.py
+```
 
-## ROI selector (Stage 1)
-
-### 1) Generate training patches
-
-Generate positive + negative patches and refresh the training index CSV:
-
-- `uv run python roi_selector.py --prepare`
-
-Or run individually:
-
-- `uv run python roi_selector.py --prepare-positive`
-- `uv run python roi_selector.py --prepare-negative`
-
-Notes:
-
-- Manually labelled negatives live in `output/roi_selector/training/negative`.
-- Newly generated negatives go to `output/roi_selector/training/negative_generated` (so we don’t overwrite manual labels).
-
-#### Optional: DL negative filter (to improve negative quality)
-
-If you trained a DL negative filter (see below), enable it during negative sampling:
-
-- `uv run python roi_selector.py --prepare-negative --use-negative-filter-dl`
-
-### 2) Create a benchmark/holdout (optional but recommended)
-
-Create a holdout set by sampling from the patch directories:
-
-- `uv run python roi_selector.py --create-benchmark --benchmark-positive-count 200 --benchmark-negative-count 200`
-
-To ensure holdout patches are never used for training, prune them out of the training directories (moves files and updates the index):
-
-- `uv run python roi_selector.py --prune-benchmark-sources`
-
-### 3) Train the ROI SVM
-
-Train a Linear SVM on extracted handcrafted features:
-
-- `uv run python roi_selector.py --train`
-
-Model artifact:
-
-- `output/roi_selector/models/roi_svm.joblib`
-
-### 4) Run inference (full-slide scan, top-$k$ ROIs)
-
-Run stage-one ROI selection over the test WSI directory:
-
-- `uv run python main.py`
-
-This uses [cabcds/roi_selector/inference.py](cabcds/roi_selector/inference.py) and writes an incremental report CSV (supports resume):
+输出（关键）：
 
 - `output/roi_selector/outputs/reports/stage_two_roi_selection.csv`
+- `output/roi_selector/outputs/patches/{train|test}/<WSI_ID>/roi_*.png`
 
-Preview patches (feature-size) are written under:
+### 3.3 40x → 10x 坐标换算逻辑（交接必读）
 
-- `output/roi_selector/outputs/patches/`
+TUPAC WSI 通常以 40x 作为 level0（基准坐标系）。ROI-Selector 在采样时会按目标倍镜（默认 10x）读取 patch：
 
-This repo supports a cleaner split layout (recommended):
+- 设 `base_mag = 40`，`target_mag = 10`，则下采样倍数 `target_downsample = base_mag / target_mag = 4`。
+- 从 OpenSlide 选择最接近该下采样倍数的读取层级 `read_level`。
+- ROI CSV 中的 `(x, y, w, h)` 坐标保持 **level0 坐标系**，读取时由 OpenSlide 在内部完成 `level` 与 `downsample` 的映射；同时 patch 的“源尺寸”会按倍镜换算成 `src_patch_size = infer_patch_size * target_downsample`，保证在 10x 语义下 patch 覆盖一致区域。
 
-- `output/roi_selector/outputs/patches/train/TUPAC-TR-xxx/roi_..png`
-- `output/roi_selector/outputs/patches/test/TUPAC-TE-xxx/roi_..png`
+这部分逻辑对应实现：`cabcds/roi_selector/utils/create_roi_patches.py::compute_sampling_params()`。
 
-You can restructure an existing mixed folder using:
+## 4. 模型训练流水线 (Training Pipeline)
 
-- `uv run python -m cabcds.roi_selector.report_export --restructure-split`
+本项目整体对应论文的多阶段结构（建议按顺序执行）：
 
-## Label Studio loop (optional)
+1) Stage 1：ROI-Selector（传统 ML）抽取 ROI patch
+2) Stage 2：MF-CNN（三个 CNN：`CNN_seg` → `CNN_det` → `CNN_global`）
+3) Stage 4：Hybrid-Descriptor（每张 WSI 15 维特征）
+4) Stage 5：WSI scorer（SVM 分类器输出最终分级）
 
-### Train negative filter (DL)
+下面重点写 Stage 2 的训练顺序与关键工程逻辑。
 
-Train a small CNN binary classifier from a simplified JSON:
+### Step 1: CNN_seg 训练（mitosis candidate segmentation）
 
-- `uv run python roi_selector.py --train-negative-filter-dl output/roi_selector/training/label_studio_exports/negative_raw_simplified.json`
+目的：从辅助有丝分裂数据中训练一个像素级分割网络，输出候选区域（blob），为后续 `CNN_det` 提供候选框。
 
-Model artifact:
+关键点（论文逻辑 + 工程化改造）：
 
-- `output/roi_selector/models/neg_filter_dl.pt`
+- **UID 级别切分防泄漏**：按 image UID 进行 60/20/20 切分（train/val/test），避免同一原图切成 patch 后同时出现在不同集合。
+- **质心标签生成**：利用 `Blue-Ratio + Otsu` 做核/有丝分裂相关区域的粗分割，并结合 centroid GT 生成训练 mask（解决“只有质心、没有像素 mask”的监督问题）。
+- **极端稀疏正样本处理**：滑窗 patch 中正像素极稀疏，单纯 shuffle 会导致模型塌陷成全背景。
+	- 使用 `WeightedRandomSampler` 对“含正像素的 patch”进行过采样，使训练批次中正样本出现频率提升。
+	- 结合 **加权 CrossEntropy**（可通过 `CABCDS_MFCNN_SEG_POS_WEIGHT` 调整，工程上常见有效范围 50~500）。
+- **Merge Val 回炉策略**：先用 val 进行调参/早停，再将 val 合并回 train 进行 final phase，以提高有效训练数据量。
 
-## Repo structure
+运行命令（示例：按论文设置训练，具体参数可在 `python -m cabcds.mf_cnn --help` 查看）：
 
-- ROI selector code: [cabcds/roi_selector](cabcds/roi_selector)
-- WSI scoring pipeline: [cabcds/wsi_scorer](cabcds/wsi_scorer)
-- Hybrid descriptor: [cabcds/hybrid_descriptor](cabcds/hybrid_descriptor)
+```bash
+# 训练 CNN_seg（建议使用 GPU/NPU；device 示例：cuda:0 / npu:0 / cpu）
+uv run python -m cabcds.mf_cnn \
+	--train-seg-paper \
+	--device <cuda:0|npu:0|cpu> \
+	--batch-size 8
+```
 
-## MF-CNN (Stage 2, WIP)
+产物（示例路径，实际以 `output/mf_cnn/CNN_seg/` 为准）：
 
-This repo includes reference implementations of the MF-CNN submodules:
+- `output/mf_cnn/CNN_seg/models/*_best.pt`
+- `output/mf_cnn/CNN_seg/models/*_last.pt`
+- `output/mf_cnn/CNN_seg/metrics/*.csv`
 
-- `CNN_seg` (VGG16-FCN): mitosis candidate segmentation (trained from centroid annotations)
-- `CNN_det` (AlexNet): mitosis / non-mitosis candidate classification
-- `CNN_global` (AlexNet): 3-class proliferation score for ROI patches
+### Step 2: CNN_det 训练（mitosis / non-mitosis classification）
 
-### Baseline smoke test (no extra downloads)
+目的：对 `CNN_seg` 的候选 blob 进一步分类过滤，将“疑似 mitosis”与大量噪声候选区分开。
 
-The baseline uses only the data already present under `dataset/`.
+关键点：
 
-- Run a quick forward+backward smoke test for `CNN_seg` + `CNN_det`:
-	- `uv run python -m cabcds.mf_cnn --smoke`
+- **从 seg 输出裁剪 patch**：对每个 blob 的 centroid 以固定窗口裁剪（默认 `80x80`）得到候选 patch，形成可落盘的训练集（index.csv）。
+- **极端类别不平衡**：在真实候选分布下，正样本率可能低至 **~0.0739**（数量级 1:10~1:100），这会导致：
+	- PR 曲线 / AP 非常低（这是“真实分布难度”的体现，并非一定是代码 bug）
+	- 需要采样策略、hard negative mining（HNMs）、阈值选择与报告指标的联合设计
 
-### Train `CNN_seg` (mitosis candidate segmentation)
+运行命令（准备数据 → 训练）：
 
-This trains a VGG16-FCN segmentation model from centroid annotations in the auxiliary mitosis dataset.
+```bash
+# 1) 用 CNN_seg 生成候选并准备 CNN_det 训练集（落盘 index.csv + patches）
+uv run python -m cabcds.mf_cnn \
+	--prepare-det \
+	--device <cuda:0|npu:0|cpu> \
+	--det-seg-checkpoint <path/to/cnn_seg_best.pt>
 
-- `uv run python -m cabcds.mf_cnn --train-seg --device cpu --batch-size 1 --seg-epochs 1 --seg-max-steps 50`
+# 2) 训练 CNN_det（可启用 WeightedRandomSampler / HNM 等选项）
+uv run python -m cabcds.mf_cnn \
+	--train-det-paper \
+	--device <cuda:0|npu:0|cpu>
+```
 
-Checkpoint output:
+产物：
 
-- `data/mf_cnn/models/cnn_seg.pt`
+- `output/mf_cnn/CNN_det/runs/<run_id>/models/*(best|last|tune)*.pt`
+- `output/mf_cnn/CNN_det/runs/<run_id>/det_patches/`
+- `output/mf_cnn/CNN_det/runs/<run_id>/metrics/*`
 
-### Prepare `CNN_det` patches using `CNN_seg` candidates (paper-aligned)
+### Step 3: CNN_global 训练（3-class proliferation scoring, 3-fold CV）
 
-This runs the trained `CNN_seg` on auxiliary tiles, converts predicted masks into connected-component candidates,
-and writes a disk-backed patch dataset + index CSV for training `CNN_det`.
+目的：对宏观纹理/全局模式进行评分（3 类），作为 Hybrid-Descriptor 的第 15 维 `roi_score` 的来源。
 
-- `uv run python -m cabcds.mf_cnn --prepare-det --device cpu --det-seg-checkpoint data/mf_cnn/models/cnn_seg.pt`
+关键点：
 
-Outputs:
+- **宏观纹理截取**：从 WSI 以固定窗口（论文设置：`512x512`，overlap=80）抽取 `global_patches` 并生成 index.csv。
+- **3 折交叉验证（CV3）**：训练 3 个 fold 模型（fold1/2/3），推理时用 **Sum Strategy** 融合（详见第 5 节）。
+- **防泄漏**：划分应以 slide/group 为单位（不要把同一张 WSI 的 patch 同时分到 train/val）。
 
-- `data/mf_cnn/det_patches/index.csv`
+运行命令（准备数据 → 训练）：
 
-### Train `CNN_det` (mitosis / non-mitosis)
+```bash
+# 1) 生成 CNN_global 训练 patch（global_patches + index.csv）
+uv run python -m cabcds.mf_cnn \
+	--prepare-global \
+	--device <cuda:0|npu:0|cpu>
 
-- `uv run python -m cabcds.mf_cnn --train-det --device cpu --batch-size 16 --det-epochs 1 --det-max-steps 200 --det-index-csv data/mf_cnn/det_patches/index.csv`
+# 2) 训练 CNN_global（论文对齐：slide-level CV，设置 3 折输出 fold1/2/3）
+uv run python -m cabcds.mf_cnn \
+	--train-global-paper \
+	--device <cuda:0|npu:0|cpu> \
+	--global-paper-cv-folds 3
 
-Checkpoint output:
+# （可选）由于测试集没有ground_truth,如果你的评估设置是从原始训练集中取400作为训练，100作为测试，可显式指定：
+   --global-paper-holdout-train-slides 400 --global-paper-holdout-test-slides 100
+```
 
-- `data/mf_cnn/models/cnn_det.pt`
+产物：
 
-### Prepare `CNN_global` patches (TUPAC train WSIs)
+- `output/mf_cnn/CNN_global/runs/<run_id>/models/cnn_global_paper_fold{1,2,3}.pt`
+- `output/mf_cnn/CNN_global/runs/<run_id>/metrics/*`
+- `output/mf_cnn/CNN_global/runs/<run_id>/global_patches/`
 
-This extracts `512x512` patches with overlap `80` from `dataset/train/*.svs` and writes:
+## 5. 特征提取与评分 (Inference & Scoring)
 
-- patches under `data/mf_cnn/global_patches/<slide_id>/*.png`
-- an index CSV at `data/mf_cnn/global_patches/index.csv`
+### 5.1 生成 15 维 Hybrid-Descriptor（Stage 4）
 
-Safe-by-default example (process 1 slide, extract 100 patches max):
+Hybrid-Descriptor 的每一维含义见：`cabcds/hybrid_descriptor/descriptor.py::HYBRID_DESCRIPTOR_FEATURE_NAMES`。
 
-- `uv run python -m cabcds.mf_cnn --prepare-global --max-slides 1 --max-patches-per-slide 100`
+流程概览：
 
-Resume is enabled by default (uses a per-slide `.done` marker). To re-run from scratch:
+- 从 ROI-Selector 生成的 ROI patch 中，逐 patch 计算：
+	- blob 统计（基于 `CNN_seg` mask + 连通域面积阈值）
+	- mitosis 计数（`CNN_seg` blob → `CNN_det` 过滤）
+	- ROI score（`CNN_global` 3 类得分）
+- 对每张 WSI 的所有 ROI metrics 做聚合，得到 15 维向量。
 
-- delete `data/mf_cnn/global_patches/` or pass `--no-resume`
+运行命令（对 train/test 任选 split 导出 CSV）：
 
-### Train `CNN_global`
+```bash
+# 例：为 test split 生成特征（会自动从 output/mf_cnn 下探测 checkpoint）
+uv run python scripts/extract_tupac_features.py \
+	--split test \
+	--out-dir output/features \
+	--device <cuda:0|npu:0|cpu>
 
-After preparing patches and `index.csv`, run a short training (safe-by-default example):
+# 输出：output/features/stage_four_hybrid_descriptors.csv
+```
 
-- `uv run python -m cabcds.mf_cnn --train-global --global-epochs 1 --global-max-steps 10`
+注意：该脚本默认对 `CNN_global` 使用 **Sum Strategy** 融合 3 个 fold（`roi_scoring_ensemble_strategy = sum`），对应论文的“多折融合更稳健”的工程实现。
 
-Slide-level validation split (recommended to avoid leakage):
+### 5.2 训练/推理最终 SVM（Stage 5）
 
-- `uv run python -m cabcds.mf_cnn --train-global --global-epochs 1 --global-val-fraction 0.2`
+最终 WSI 评分器是一个 group-keyed 的 SVM（带 StandardScaler），用于输出 3 类分级，并以 Quadratic Weighted Kappa 作为核心指标。
 
-Data augmentation (enabled by default):
+训练命令：
 
-- Disable: `uv run python -m cabcds.mf_cnn --train-global --no-global-augment`
-- Adjust jitter: `uv run python -m cabcds.mf_cnn --train-global --global-color-jitter 0.05`
+```bash
+uv run python scripts/train_wsi_scorer.py \
+	--features-csv <path/to/stage_four_hybrid_descriptors.csv> \
+	--labels-csv <path/to/labels.csv> \
+	--out-dir output/wsi_scorer
+```
 
-Checkpoint output:
+推理命令（模块入口，支持覆盖特征/模型/报告目录）：
 
-- `data/mf_cnn/models/cnn_global.pt`
+```bash
+uv run python -m cabcds.wsi_scorer \
+	--mode predict \
+	--predict-descriptor-csv <path/to/stage_four_hybrid_descriptors.csv> \
+	--model-output-path <path/to/wsi_svm.joblib> \
+	--report-dir <path/to/report_dir>
+```
 
-### Optional external mitosis datasets (placeholders)
+关于 fold 融合：
 
-The paper improves `CNN_seg` generalization by adding external mitosis datasets
-(e.g. MITOS12 / MITOS14 / AMIDA13(+1)). This repo reserves the following paths:
+- `CNN_global` 在 Stage 4 通过 **Sum Strategy** 融合 3 个 fold 的预测，得到更稳定的 ROI score。
+- SVM 本身是单模型（可用脚本内的小网格搜索选择 `C` / `class_weight`）。
 
-- `dataset/external/mitos12/`
-- `dataset/external/mitos14/`
+## 6. 开发者避坑指南 (Developer Notes / Gotchas)
 
-They are **not required** to run the baseline. If you place external centroid-style
-tiles on disk, you can enable mixed sampling via:
+1) **Test AP 很低并不一定是 bug**
+	 - 在 `CNN_det` 场景，候选生成后真实分布的正样本率可能低至 ~0.07，AP/PR 非常敏感。
+	 - 建议同时看：阈值下的 recall、误检分布、以及最终 Stage 5 的 Kappa（端到端指标）。
 
-- `CABCDS_MFCNN_USE_EXTERNAL_MITOSIS_DATASETS=true`
+2) **防泄漏是第一优先级**
+	 - `CNN_seg` 必须 UID/image-level 切分；`CNN_global` 与 SVM 必须 group/slide-level 切分。
+	 - 任何“按 patch 随机打散”的 split 都会造成过高的离线指标但线上失效。
 
-## Troubleshooting
+3) **ROI-Selector 的负样本质量决定下游上限**
+	 - 真实 WSI 中“暗色/污渍/折痕/空白”会大量进入负样本池，导致训练分布漂移。
+	 - 本项目为此引入了：
+		 - DL negative filter（可选，用于过滤可疑负样本）
+		 - 白底过滤、暗色过滤、tissue 统计等启发式（见 `cabcds/roi_selector/utils/features.py` 等）
 
-- If you interrupt inference, re-running `uv run python main.py` will skip already-processed slides based on the existing report CSV.
+4) **极端不平衡必须“采样 + loss + 评估”三件套一起设计**
+	 - 仅改 loss（例如加权 CE）或仅过采样都可能不稳定。
+	 - 建议保留 `det_patches/` 与 `global_patches/`，后续调参/复现/重训才不会卡在数据准备环节。
+
+5) **OpenSlide/倍率/坐标问题**
+	 - ROI CSV 的坐标系、OpenSlide level 的 downsample、以及 patch resize 的语义必须一致。
+	 - 优先验证：同一 ROI 坐标在 40x 与 10x 下抽到的组织区域是否一致
